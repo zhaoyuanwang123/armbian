@@ -1,5 +1,5 @@
 #!/bin/bash
-[[ "$1" == "prereqs" ]] && exit 0
+[ "$1" = "prereqs" ] && exit 0
 . /usr/share/initramfs-tools/hook-functions
 
 copy_exec "/usr/local/bin/setup-usbgadget-network.sh"

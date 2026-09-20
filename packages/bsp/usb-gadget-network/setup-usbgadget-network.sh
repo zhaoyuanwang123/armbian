@@ -33,7 +33,11 @@ setup_usb_network_configfs() {
 	echo "$usb_idProduct" > "$CONFIGFS/g1/idProduct"
 	echo 0x0100 > "$CONFIGFS/g1/bcdDevice"
 	echo 0x0200 > "$CONFIGFS/g1/bcdUSB"
-
+# ★ 新增:UDC 不存在就直接退出,不留残留
+    if [ -z "$(ls /sys/class/udc)" ]; then
+            echo "  No USB Device Controller available"
+            return
+    fi
 	# Create english (0x409) strings
 	mkdir $CONFIGFS/g1/strings/0x409 || echo "  Couldn't create $CONFIGFS/g1/strings/0x409"
 

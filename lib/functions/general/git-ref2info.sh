@@ -150,6 +150,18 @@ function memoized_git_ref_to_info() {
 			makefile_url="undetermined"      # outer scope
 			makefile_version="undetermined"  # outer scope
 			makefile_codename="undetermined" # outer scope
+			if [[ "${git_source}" == "/"* ]] || [[ "${git_source}" == "file://"* ]]; then
+            local local_path="${git_source#file://}"
+            local makefile_local_path="${local_path}/Makefile"
+            if [[ -f "${makefile_local_path}" ]]; then
+                display_alert "Reading Makefile from local path" "${makefile_local_path}" "info"
+                makefile_body="$(cat "${makefile_local_path}")"
+                parse_makefile_version "${makefile_body}"
+                return 0
+            else
+                exit_with_error "Local Makefile not found at '${makefile_local_path}'"
+            fi
+        fi
 
 			declare url="undetermined"
 			case "${git_source}" in

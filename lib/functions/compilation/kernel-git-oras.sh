@@ -31,7 +31,7 @@ function kernel_prepare_bare_repo_decide_shallow_or_full() {
 	#   - vendor kernels (looking at you, rockchip-rk3588) are a mess and will cause fetches to unshallow?
 	#   - if free disk space on target is less than 32gb (magic number?) use the shallow. It won't fit otherwise.
 	#   - if the target resides on `mmc` device, use the shallow. It's too much disk traffic otherwise.
-	#   - TODO: might be we don't carry a shallow gitball in ghcr.io for the wanted version -- how to know?
+	#   - TODO: might be we don't carry a shallow gitball in ghcr.nju.edu.cn for the wanted version -- how to know?
 
 	# validate kernel_work_dir is set
 	[[ -z "${kernel_work_dir}" ]] && exit_with_error "kernel_work_dir is not set"

@@ -292,11 +292,11 @@ function do_main_configuration() {
 			GHCR_MIRROR_ADDRESS="${GHCR_MIRROR_ADDRESS:-"ghcr.dockerproxy.net"}"
 			declare -g -r GHCR_SOURCE=$GHCR_MIRROR_ADDRESS
 			;;
-		nju)
+		1ms)
 			declare -g -r GHCR_SOURCE='ghcr.nju.edu.cn'
 			;;
 		*)
-			declare -g -r GHCR_SOURCE='ghcr.io'
+			declare -g -r GHCR_SOURCE='ghcr.1ms.run'
 			;;
 	esac
 

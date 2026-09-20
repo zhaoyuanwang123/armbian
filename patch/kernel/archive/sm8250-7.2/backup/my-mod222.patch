@@ -1,0 +1,39 @@
+--- a/arch/arm64/boot/dts/qcom/pm8150b.dtsi	2026-09-18 01:46:15.519081474 +0800
++++ b/arch/arm64/boot/dts/qcom/pm8150b.dtsi	2026-09-18 01:29:45.100647109 +0800
+@@ -59,3 +59,36 @@
+ 		};
+ 		
++		pm8150b_fg: fuel-gauge@4000 {
++			compatible = "qcom,pm8150b-fg";
++			reg = <0x4000>;
++			interrupts = <0x2 0x40 0x0 IRQ_TYPE_EDGE_BOTH>;
++			interrupt-names = "soc-delta";
++			status = "disabled";
++		};
++
++		pm8150b_charger: charger@1000 {
++			compatible = "qcom,pm8150b-charger";
++			reg = <0x1000>;
++			interrupts = <0x2 0x13 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x1 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x2 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x3 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x5 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x6 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x7 IRQ_TYPE_EDGE_BOTH>;
++			interrupt-names = "bat-ov",
++					  "usbin-plugin",
++					  "usbin-icl-change",
++					  "wdog-bark",
++					  "usb-plugin",
++					  "usb-icl-change",
++					  "dc-plugin",
++					  "dc-icl-change";
++			io-channels = <&pm8150b_adc ADC5_USB_IN_V_16>,
++				      <&pm8150b_adc ADC5_USB_IN_I>;
++			io-channel-names = "usb_in_v_div_16", "usb_in_i_uv";
++			status = "disabled";
++		};
++
+ 		pm8150b_typec: typec@1500 {

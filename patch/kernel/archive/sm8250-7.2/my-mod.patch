@@ -1,0 +1,187 @@
+--- a/arch/arm64/boot/dts/qcom/Makefile	2026-09-18 01:46:15.503845686 +0800
++++ b/arch/arm64/boot/dts/qcom/Makefile	2026-09-18 01:29:45.083930553 +0800
+@@ -360,6 +357,7 @@
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-sony-xperia-edo-pdx203.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-sony-xperia-edo-pdx206.dtb
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-xiaomi-umi.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-xiaomi-elish-boe.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-xiaomi-elish-csot.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-xiaomi-pipa.dtb
+--- a/arch/arm64/boot/dts/qcom/sm8250.dtsi	2026-09-18 01:46:15.519081474 +0800
++++ b/arch/arm64/boot/dts/qcom/sm8250.dtsi	2026-09-18 01:29:45.100647109 +0800
+@@ -993,7 +993,7 @@
+ 		};
+ 
+ 		gpi_dma2: dma-controller@800000 {
+-			compatible = "qcom,sm8250-gpi-dma", "qcom,sdm845-gpi-dma";
++			compatible = "qcom,sm8250-gpi-dma-1", "qcom,sdm845-gpi-dma";
+ 			reg = <0 0x00800000 0 0x70000>;
+ 			interrupts = <GIC_SPI 588 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 589 IRQ_TYPE_LEVEL_HIGH>,
+@@ -1330,7 +1330,7 @@
+ 		};
+ 
+ 		gpi_dma0: dma-controller@900000 {
+-			compatible = "qcom,sm8250-gpi-dma", "qcom,sdm845-gpi-dma";
++			compatible = "qcom,sm8250-gpi-dma-0", "qcom,sdm845-gpi-dma";
+ 			reg = <0 0x00900000 0 0x70000>;
+ 			interrupts = <GIC_SPI 244 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 245 IRQ_TYPE_LEVEL_HIGH>,
+@@ -1760,7 +1760,7 @@
+ 		};
+ 
+ 		gpi_dma1: dma-controller@a00000 {
+-			compatible = "qcom,sm8250-gpi-dma", "qcom,sdm845-gpi-dma";
++			compatible = "qcom,sm8250-gpi-dma-1", "qcom,sdm845-gpi-dma";
+ 			reg = <0 0x00a00000 0 0x70000>;
+ 			interrupts = <GIC_SPI 279 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 280 IRQ_TYPE_LEVEL_HIGH>,
+@@ -2464,7 +2464,7 @@
+ 
+ 			status = "disabled";
+ 
+-			pcie@0 {
++			pcieport2: pcie@0 {
+ 				device_type = "pci";
+ 				reg = <0x0 0x0 0x0 0x0 0x0>;
+ 				bus-range = <0x01 0xff>;
+--- a/arch/arm64/boot/dts/qcom/pm8150b.dtsi	2026-09-18 01:46:15.519081474 +0800
++++ b/arch/arm64/boot/dts/qcom/pm8150b.dtsi	2026-09-18 01:29:45.100647109 +0800
+@@ -59,3 +59,36 @@
+ 		};
+ 		
++		pm8150b_fg: fuel-gauge@4000 {
++			compatible = "qcom,pm8150b-fg";
++			reg = <0x4000>;
++			interrupts = <0x2 0x40 0x0 IRQ_TYPE_EDGE_BOTH>;
++			interrupt-names = "soc-delta";
++			status = "disabled";
++		};
++
++		pm8150b_charger: charger@1000 {
++			compatible = "qcom,pm8150b-charger";
++			reg = <0x1000>;
++			interrupts = <0x2 0x13 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x1 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x2 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x3 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x5 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x6 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x7 IRQ_TYPE_EDGE_BOTH>;
++			interrupt-names = "bat-ov",
++					  "usbin-plugin",
++					  "usbin-icl-change",
++					  "wdog-bark",
++					  "usb-plugin",
++					  "usb-icl-change",
++					  "dc-plugin",
++					  "dc-icl-change";
++			io-channels = <&pm8150b_adc ADC5_USB_IN_V_16>,
++				      <&pm8150b_adc ADC5_USB_IN_I>;
++			io-channel-names = "usb_in_v_div_16", "usb_in_i_uv";
++			status = "disabled";
++		};
++
+ 		pm8150b_typec: typec@1500 {
+--- a/drivers/dma/qcom/gpi.c	2026-09-18 01:46:16.078139169 +0800
++++ b/drivers/dma/qcom/gpi.c	2026-09-18 01:29:45.639797340 +0800
+@@ -2306,6 +2306,9 @@
+ 	{ .compatible = "qcom,sc7280-gpi-dma", .data = (void *)0x10000 },
+ 	{ .compatible = "qcom,sm8150-gpi-dma", .data = (void *)0x0 },
+ 	{ .compatible = "qcom,sm8250-gpi-dma", .data = (void *)0x0 },
++	{ .compatible = "qcom,sm8250-gpi-dma-0", .data = (void *)0x1000 },
++	{ .compatible = "qcom,sm8250-gpi-dma-1", .data = (void *)0x6000 },
++	{ .compatible = "qcom,sm8250-gpi-dma-1", .data = (void *)0x6000 },
+ 	{ .compatible = "qcom,sm8350-gpi-dma", .data = (void *)0x10000 },
+ 	{ .compatible = "qcom,sm8450-gpi-dma", .data = (void *)0x10000 },
+ 	{ },
+
+--- a/drivers/gpu/drm/panel/Kconfig	2026-09-18 01:46:17.171588797 +0800
++++ b/drivers/gpu/drm/panel/Kconfig	2026-09-18 01:29:46.642617350 +0800
+@@ -382,6 +382,19 @@
+ 	  The panel has a 2560×1800 resolution. It provides a MIPI DSI interface
+ 	  to the host.
+ 
++config DRM_PANEL_CSOT_MP42020B
++	tristate "CSOT MP42020B DSI panel"
++	depends on OF && GPIOLIB
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	select DRM_DISPLAY_DSC_HELPER
++	select DRM_DISPLAY_HELPER
++	help
++	  Say Y here if you want to enable support for CSOT MP42020B DSI
++	  command mode panel as found in Xiaomi 10.
++	  The panel has a 2340×1080 resolution. It provides a MIPI DSI interface
++	  to the host.
++
+ config DRM_PANEL_JDI_LT070ME05000
+ 	tristate "JDI LT070ME05000 WUXGA DSI panel"
+ 	depends on OF
+--- a/drivers/gpu/drm/panel/Makefile	2026-09-18 01:46:17.174337715 +0800
++++ b/drivers/gpu/drm/panel/Makefile	2026-09-18 01:29:46.645193382 +0800
+@@ -10,6 +11,7 @@
+ obj-$(CONFIG_DRM_PANEL_BOE_TV101WUM_LL2) += panel-boe-tv101wum-ll2.o
+ obj-$(CONFIG_DRM_PANEL_BOE_TV101WUM_NL6) += panel-boe-tv101wum-nl6.o
+ obj-$(CONFIG_DRM_PANEL_CHIPWEALTH_CH13726A) += panel-chipwealth-ch13726a.o
++obj-$(CONFIG_DRM_PANEL_CSOT_MP42020B) += panel-j2-mp-42-02-0b-dsc.o
+ obj-$(CONFIG_DRM_PANEL_DSI_CM) += panel-dsi-cm.o
+ obj-$(CONFIG_DRM_PANEL_LVDS) += panel-lvds.o
+ obj-$(CONFIG_DRM_PANEL_SIMPLE) += panel-simple.o
+--- a/drivers/input/touchscreen/Kconfig	2026-09-18 01:46:17.402603638 +0800
++++ b/drivers/input/touchscreen/Kconfig	2026-09-18 01:29:46.853029409 +0800
+@@ -12,6 +12,8 @@
+ 
+ if INPUT_TOUCHSCREEN
+ 
++source "drivers/input/touchscreen/stfts/Kconfig"
++
+ config TOUCHSCREEN_88PM860X
+ 	tristate "Marvell 88PM860x touchscreen"
+ 	depends on MFD_88PM860X
+@@ -487,6 +489,12 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called hynitron-cst816x.
+ 
++config TOUCHSCREEN_HYNITRON_ALL
++	tristate "Hynitron touchscreen support"
++	depends on I2C
++	help
++		Support Hynitron 66xx/3240/92xx/3xx/1xx/7xx/8xxt
++
+ config TOUCHSCREEN_ILI210X
+ 	tristate "Ilitek ILI210X based touchscreen"
+ 	depends on I2C
+--- a/drivers/input/touchscreen/Makefile	2026-09-18 01:46:17.402603638 +0800
++++ b/drivers/input/touchscreen/Makefile	2026-09-18 01:29:46.853029409 +0800
+@@ -82,6 +83,7 @@
+ obj-$(CONFIG_TOUCHSCREEN_SIS_I2C)	+= sis_i2c.o
+ obj-$(CONFIG_TOUCHSCREEN_ST1232)	+= st1232.o
+ obj-$(CONFIG_TOUCHSCREEN_STMFTS)	+= stmfts.o
++obj-$(CONFIG_TOUCHSCREEN_ST_FTS)	+= stfts/
+ obj-$(CONFIG_TOUCHSCREEN_STMPE)		+= stmpe-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_SUN4I)		+= sun4i-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_SUR40)		+= sur40.o
+--- a/sound/soc/codecs/cs35l41-lib.c	2026-09-18 01:46:19.181950285 +0800
++++ b/sound/soc/codecs/cs35l41-lib.c	2026-09-18 01:29:48.597367897 +0800
+@@ -1266,11 +1266,15 @@
+ 		if (ret || enable)
+ 			return ret;
+ 
+-		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
++//		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
++//					int_status, int_status & pup_pdn_mask,
++//					1000, 100000);
++
++		regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
+ 					int_status, int_status & pup_pdn_mask,
+ 					1000, 100000);
+-		if (ret)
+-			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
++//		if (ret)
++//			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
+ 
+ 		/* Clear PUP/PDN status */
+ 		regmap_write(regmap, CS35L41_IRQ1_STATUS1, pup_pdn_mask);

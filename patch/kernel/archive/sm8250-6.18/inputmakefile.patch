@@ -1,0 +1,10 @@
+--- a/drivers/input/touchscreen/Makefile	2026-09-14 02:24:41.848374900 +0800
++++ b/drivers/input/touchscreen/Makefile	2026-09-14 02:32:23.133812627 +0800
+@@ -37,6 +37,7 @@
+ obj-$(CONFIG_TOUCHSCREEN_HYCON_HY46XX)	+= hycon-hy46xx.o
+ obj-$(CONFIG_TOUCHSCREEN_GUNZE)		+= gunze.o
+ obj-$(CONFIG_TOUCHSCREEN_EETI)		+= eeti_ts.o
++obj-$(CONFIG_TOUCHSCREEN_ST_FTS)	+= stfts/
+ obj-$(CONFIG_TOUCHSCREEN_EKTF2127)	+= ektf2127.o
+ obj-$(CONFIG_TOUCHSCREEN_ELAN)		+= elants_i2c.o
+ obj-$(CONFIG_TOUCHSCREEN_ELO)		+= elo.o

@@ -1,0 +1,1 @@
+savedcmd_drivers/input/touchscreen/stfts/built-in.a := rm -f drivers/input/touchscreen/stfts/built-in.a;  printf "drivers/input/touchscreen/stfts/%s " fts.o fts_proc.o fts_lib/built-in.a | xargs aarch64-linux-gnu-ar cDPrST drivers/input/touchscreen/stfts/built-in.a

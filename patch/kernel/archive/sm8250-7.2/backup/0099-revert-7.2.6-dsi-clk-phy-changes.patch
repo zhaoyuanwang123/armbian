@@ -1,0 +1,35 @@
+From: local
+Subject: [PATCH] Revert 7.2.6 DSI clk/PLL changes back to rc5 behaviour
+
+7.2.6 introduced two DSI-side changes that break the CSOT J2 panel
+(snow/noise on screen): byte_clk_rate is now overwritten by
+clk_round_rate(), and the 7nm PLL enable/disable path was refactored
+to skip reconfiguration when pll_enable_cnt is non-zero.
+Revert both.
+
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -669,23 +668,11 @@
+ int dsi_calc_clk_rate_6g(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
+ {
+-	long rounded_byte_clk_rate;
+-
+ 	if (!msm_host->mode) {
+ 		pr_err("%s: mode not set\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+ 	dsi_calc_pclk(msm_host, is_bonded_dsi);
+-
+-	rounded_byte_clk_rate = clk_round_rate(msm_host->byte_clk,
+-					       msm_host->byte_clk_rate);
+-	if (rounded_byte_clk_rate < 0) {
+-		pr_err("%s: failed to round byte clock rate, %ld\n",
+-		       __func__, rounded_byte_clk_rate);
+-		return rounded_byte_clk_rate;
+-	}
+-
+-	msm_host->byte_clk_rate = rounded_byte_clk_rate;
+ 	msm_host->esc_clk_rate = clk_get_rate(msm_host->esc_clk);
+ 	return 0;
+ }

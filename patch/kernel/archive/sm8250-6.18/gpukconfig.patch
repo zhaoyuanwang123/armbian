@@ -1,0 +1,20 @@
+--- a/drivers/gpu/drm/panel/Kconfig	2026-09-14 02:24:41.844703400 +0800
++++ b/drivers/gpu/drm/panel/Kconfig	2026-09-14 02:32:52.832503399 +0800
+@@ -17,6 +17,17 @@
+ 	  Y030XX067A 320x480 3.0" panel as found in the YLM RG-280M, RG-300
+ 	  and RG-99 handheld gaming consoles.
+ 
++config DRM_PANEL_CSOT_MP42020B
++	tristate "CSOT MP42020B DSI panel"
++	depends on OF && GPIOLIB
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	help
++	  Say Y here if you want to enable support for CSOT MP42020B DSI
++	  command mode panel as found in Xiaomi 10.
++	  The panel has a 2340×1080 resolution. It provides a MIPI DSI interface
++	  to the host.
++	  
+ config DRM_PANEL_ARM_VERSATILE
+ 	tristate "ARM Versatile panel driver"
+ 	depends on OF

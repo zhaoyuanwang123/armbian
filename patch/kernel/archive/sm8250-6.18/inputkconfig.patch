@@ -1,0 +1,12 @@
+--- a/drivers/input/touchscreen/Kconfig	2026-09-14 02:24:41.848374900 +0800
++++ b/drivers/input/touchscreen/Kconfig	2026-09-14 02:31:58.546346924 +0800
+@@ -11,7 +11,7 @@
+ 	  If unsure, say Y.
+ 
+ if INPUT_TOUCHSCREEN
+-
++source "drivers/input/touchscreen/stfts/Kconfig"
+ config TOUCHSCREEN_88PM860X
+ 	tristate "Marvell 88PM860x touchscreen"
+ 	depends on MFD_88PM860X
+怎么改

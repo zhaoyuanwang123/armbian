@@ -1,1 +1,0 @@
-savedcmd_drivers/input/touchscreen/stfts/fts_lib/built-in.a := rm -f drivers/input/touchscreen/stfts/fts_lib/built-in.a;  printf "drivers/input/touchscreen/stfts/fts_lib/%s " ftsCompensation.o ftsCore.o ftsError.o ftsFrame.o ftsIO.o ftsTest.o ftsTime.o ftsTool.o ftsFlash.o ftsGesture.o | xargs aarch64-linux-gnu-ar cDPrST drivers/input/touchscreen/stfts/fts_lib/built-in.a

@@ -462,6 +462,7 @@ function prepare_partitions() {
 		if [[ $CRYPTROOT_ENABLE == yes ]]; then
 			echo "rootdev=$rootdevice cryptdevice=UUID=${physical_root_part_uuid}:$CRYPTROOT_MAPPER" >> "${SDCARD}/boot/armbianEnv.txt"
 		else
+			grep -q '^rootdev=' "${SDCARD}/boot/armbianEnv.txt" || \
 			echo "rootdev=$rootfs" >> "${SDCARD}/boot/armbianEnv.txt"
 		fi
 		echo "rootfstype=$ROOTFS_TYPE" >> "${SDCARD}/boot/armbianEnv.txt"

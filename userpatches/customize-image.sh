@@ -135,3 +135,8 @@ fi
 
 echo ">>> [customize] WiFi 配置完成"
 echo ">>> [customize] 完成"
+
+# 把 fstab 里的根分区改成 PARTLABEL=linux
+if [[ -f /etc/fstab ]]; then
+    sed -i -E 's|^UUID=[^[:space:]]+([[:space:]]+/[[:space:]])|PARTLABEL=linux\1|' /etc/fstab
+fi

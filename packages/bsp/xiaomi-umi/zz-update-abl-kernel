@@ -10,6 +10,12 @@ case $machine_model in
         exit 1
         ;;
 esac
+# 取当前正在安装的内核版本
+kernel_version="${2#/boot/vmlinuz-}"
+if [ -z "$kernel_version" ]; then
+    echo "kernel version not provided, exit"
+    exit 1
+fi
 source /boot/armbianEnv.txt
 new_rootfs_image_uuid="${rootdev}"
 gzip -c /boot/vmlinuz-*-sm8250 > /tmp/Image.gz
@@ -19,7 +25,7 @@ cat /tmp/Image.gz /usr/lib/linux-image-*-sm8250/qcom/${dtb_name}.dtb > /tmp/Imag
 source /boot/armbianEnv.txt
 /usr/bin/mkbootimg \
         --kernel /tmp/Image.gz-dtb \
-        --ramdisk /boot/initrd.img-*-sm8250 \
+        --ramdisk "/boot/initrd.img-${kernel_version}" \
         --base 0x0 \
         --second_offset 0x00f00000 \
         --cmdline "root=${rootdev} ${extraargs}" \

@@ -75,6 +75,7 @@
 		voltage-max-design-microvolt = <4400000>;
 		charge-full-design-microamp-hours = <4680000>;
 		energy-full-design-microwatt-hours = <18400000>;
+		constant-charge-current-max-microamp = <1500000>;
 	};
 
 	chosen {
@@ -1027,10 +1028,10 @@
 		label = "conn_therm";
 	};
 	channel@7 {
-			reg = <0x07>;
-			qcom,pre-scaling = <1 1>;
-			label = "usb_in_i_uv";
-		};
+		reg = <0x07>;
+		qcom,pre-scaling = <1 1>;
+		label = "usb_in_i_uv";
+	};
 
 	channel@8 {
 		reg = <0x08>;
@@ -1539,9 +1540,9 @@
 	status = "okay";
 	monitored-battery = <&battery>;
 
-	io-channels = <&pm8150b_adc ADC5_USB_IN_I>,
-	              <&pm8150b_adc ADC5_USB_IN_V_16>;
-	io-channel-names = "usb_in_i_uv", "usb_in_v_div_16";
+	io-channels = <&pm8150b_adc ADC5_USB_IN_V_16>,
+	              <&pm8150b_adc ADC5_USB_IN_I>;
+	io-channel-names = "usbin_v", "usbin_i";
 };
 
 &pm8150b_fg {
@@ -1568,7 +1569,7 @@
 		power-role = "dual";
 		data-role = "dual";
 		self-powered;
-		accessory-mode-audio = <1>;
+		accessory-mode-audio;
 		vbus-supply = <&pm8150b_vbus>;
 
 		source-pdos = <PDO_FIXED(5000, 3000,

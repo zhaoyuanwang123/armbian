@@ -1,0 +1,2338 @@
+From: Zhao_Wang <umi@xiaomi>
+Subject: [PATCH] IPA: v4.5 (sm8250) modem data path with IPA-MHI
+
+Xiaomi Mi 10 (umi): IPA: v4.5 (sm8250) modem data path with IPA-MHI — ported from the Mi 10T pmOS
+kernel set onto 7.2.11; naming unified to umi. Part of the
+SDX55m external modem (mobile data) bring-up.
+
+Signed-off-by: Zhao_Wang <umi@xiaomi>
+---
+--- a/drivers/net/ipa/Makefile
++++ b/drivers/net/ipa/Makefile
+@@ -16,7 +16,7 @@
+ 				gsi_trans.o ipa_gsi.o ipa_smp2p.o ipa_uc.o \
+ 				ipa_endpoint.o ipa_cmd.o ipa_modem.o \
+ 				ipa_resource.o ipa_qmi.o ipa_qmi_msg.o \
+-				ipa_sysfs.o
++				ipa_mhi.o ipa_sysfs.o
+ 
+ ipa-y			+=	$(IPA_REG_VERSIONS:%=reg/ipa_reg-v%.o)
+ 
+--- a/drivers/net/ipa/data/ipa_data-v4.5.c
++++ b/drivers/net/ipa/data/ipa_data-v4.5.c
+@@ -61,7 +61,7 @@
+ static const struct ipa_gsi_endpoint_data ipa_gsi_endpoint_data[] = {
+ 	[IPA_ENDPOINT_AP_COMMAND_TX] = {
+ 		.ee_id		= GSI_EE_AP,
+-		.channel_id	= 9,
++		.channel_id	= 12,
+ 		.endpoint_id	= 7,
+ 		.toward_ipa	= true,
+ 		.channel = {
+@@ -82,8 +82,8 @@
+ 	},
+ 	[IPA_ENDPOINT_AP_LAN_RX] = {
+ 		.ee_id		= GSI_EE_AP,
+-		.channel_id	= 10,
+-		.endpoint_id	= 16,
++		.channel_id	= 13,
++		.endpoint_id	= 13,
+ 		.toward_ipa	= false,
+ 		.channel = {
+ 			.tre_count	= 256,
+--- a/drivers/net/ipa/gsi.c
++++ b/drivers/net/ipa/gsi.c
+@@ -2070,28 +2070,42 @@
+ 	int ret;
+ 
+ 	/* Here is where we first touch the GSI hardware */
++	dev_info(gsi->dev, "gsi_setup: reading GSI_STATUS\n");
+ 	reg = gsi_reg(gsi, GSI_STATUS);
+ 	val = ioread32(gsi->virt + reg_offset(reg));
+ 	if (!(val & reg_bit(reg, ENABLED))) {
+ 		dev_err(gsi->dev, "GSI has not been enabled\n");
+ 		return -EIO;
+ 	}
+-
++	dev_info(gsi->dev, "gsi_setup: GSI_STATUS=0x%08x enabled\n", val);
++
++	dev_info(gsi->dev, "gsi_setup: irq_setup begin\n");
+ 	ret = gsi_irq_setup(gsi);
+-	if (ret)
++	if (ret) {
++		dev_err(gsi->dev, "gsi_setup: irq_setup failed: %d\n", ret);
+ 		return ret;
+-
++	}
++	dev_info(gsi->dev, "gsi_setup: irq_setup done\n");
++
++	dev_info(gsi->dev, "gsi_setup: ring_setup begin\n");
+ 	ret = gsi_ring_setup(gsi);	/* No matching teardown required */
+-	if (ret)
++	if (ret) {
++		dev_err(gsi->dev, "gsi_setup: ring_setup failed: %d\n", ret);
+ 		goto err_irq_teardown;
++	}
++	dev_info(gsi->dev, "gsi_setup: ring_setup done\n");
+ 
+ 	/* Initialize the error log */
+ 	reg = gsi_reg(gsi, ERROR_LOG);
+ 	iowrite32(0, gsi->virt + reg_offset(reg));
+ 
++	dev_info(gsi->dev, "gsi_setup: channel_setup begin\n");
+ 	ret = gsi_channel_setup(gsi);
+-	if (ret)
++	if (ret) {
++		dev_err(gsi->dev, "gsi_setup: channel_setup failed: %d\n", ret);
+ 		goto err_irq_teardown;
++	}
++	dev_info(gsi->dev, "gsi_setup: channel_setup done\n");
+ 
+ 	return 0;
+ 
+--- a/drivers/net/ipa/ipa_main.c
++++ b/drivers/net/ipa/ipa_main.c
+@@ -115,42 +115,68 @@
+ 	struct device *dev = ipa->dev;
+ 	int ret;
+ 
++	dev_info(dev, "ipa_setup: gsi_setup begin\n");
+ 	ret = gsi_setup(&ipa->gsi);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "ipa_setup: gsi_setup failed: %d\n", ret);
+ 		return ret;
+-
++	}
++	dev_info(dev, "ipa_setup: gsi_setup done\n");
++
++	dev_info(dev, "ipa_setup: endpoint_setup begin\n");
+ 	ipa_endpoint_setup(ipa);
++	dev_info(dev, "ipa_setup: endpoint_setup done\n");
+ 
+ 	/* We need to use the AP command TX endpoint to perform other
+ 	 * initialization, so we enable first.
+ 	 */
+ 	command_endpoint = ipa->name_map[IPA_ENDPOINT_AP_COMMAND_TX];
++	dev_info(dev, "ipa_setup: enabling command endpoint\n");
+ 	ret = ipa_endpoint_enable_one(command_endpoint);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "ipa_setup: command endpoint enable failed: %d\n", ret);
+ 		goto err_endpoint_teardown;
+-
++	}
++
++	dev_info(dev, "ipa_setup: mem_setup begin\n");
+ 	ret = ipa_mem_setup(ipa);	/* No matching teardown required */
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "ipa_setup: mem_setup failed: %d\n", ret);
+ 		goto err_command_disable;
+-
++	}
++	dev_info(dev, "ipa_setup: mem_setup done\n");
++
++	dev_info(dev, "ipa_setup: table_setup begin\n");
+ 	ret = ipa_table_setup(ipa);	/* No matching teardown required */
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "ipa_setup: table_setup failed: %d\n", ret);
+ 		goto err_command_disable;
++	}
++	dev_info(dev, "ipa_setup: table_setup done\n");
+ 
+ 	/* Enable the exception handling endpoint, and tell the hardware
+ 	 * to use it by default.
+ 	 */
+ 	exception_endpoint = ipa->name_map[IPA_ENDPOINT_AP_LAN_RX];
++	dev_info(dev, "ipa_setup: enabling exception endpoint\n");
+ 	ret = ipa_endpoint_enable_one(exception_endpoint);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "ipa_setup: exception endpoint enable failed: %d\n", ret);
+ 		goto err_command_disable;
++	}
+ 
+ 	ipa_endpoint_default_route_set(ipa, exception_endpoint->endpoint_id);
++	dev_info(dev, "ipa_setup: default route set to endpoint %u\n",
++		 exception_endpoint->endpoint_id);
+ 
+ 	/* We're all set.  Now prepare for communication with the modem */
++	dev_info(dev, "ipa_setup: qmi_setup begin\n");
+ 	ret = ipa_qmi_setup(ipa);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "ipa_setup: qmi_setup failed: %d\n", ret);
+ 		goto err_default_route_clear;
++	}
++	dev_info(dev, "ipa_setup: qmi_setup done\n");
+ 
+ 	ipa->setup_complete = true;
+ 
+@@ -599,6 +625,8 @@
+ 			ret);
+ 		return ret;
+ 	}
++	dev_info(dev, "IPA firmware memory resource start=%pa end=%pa\n",
++		 &res.start, &res.end);
+ 
+ 	/* Use name from DTB if specified; use default for *any* error */
+ 	ret = of_property_read_string(dev->of_node, "firmware-name", &path);
+@@ -608,14 +636,18 @@
+ 		path = IPA_FW_PATH_DEFAULT;
+ 	}
+ 
++	dev_info(dev, "requesting IPA firmware \"%s\"\n", path);
+ 	ret = request_firmware(&fw, path, dev);
+ 	if (ret) {
+ 		dev_err(dev, "error %d requesting \"%s\"\n", ret, path);
+ 		return ret;
+ 	}
++	dev_info(dev, "requested IPA firmware \"%s\" size=%zu\n", path, fw->size);
+ 
+ 	phys = res.start;
+ 	size = (size_t)resource_size(&res);
++	dev_info(dev, "remapping IPA firmware memory phys=%pa size=%zd\n",
++		 &phys, size);
+ 	virt = memremap(phys, size, MEMREMAP_WC);
+ 	if (!virt) {
+ 		dev_err(dev, "unable to remap firmware memory\n");
+@@ -623,11 +655,19 @@
+ 		goto out_release_firmware;
+ 	}
+ 
++	dev_info(dev, "loading IPA firmware \"%s\" with PAS id %u\n", path, IPA_PAS_ID);
+ 	ret = qcom_mdt_load(dev, fw, path, IPA_PAS_ID, virt, phys, size, NULL);
+ 	if (ret)
+ 		dev_err(dev, "error %d loading \"%s\"\n", ret, path);
+-	else if ((ret = qcom_scm_pas_auth_and_reset(IPA_PAS_ID)))
+-		dev_err(dev, "error %d authenticating \"%s\"\n", ret, path);
++	else {
++		dev_info(dev, "loaded IPA firmware \"%s\"; authenticating and resetting PAS id %u\n",
++			 path, IPA_PAS_ID);
++		ret = qcom_scm_pas_auth_and_reset(IPA_PAS_ID);
++		if (ret)
++			dev_err(dev, "error %d authenticating \"%s\"\n", ret, path);
++		else
++			dev_info(dev, "authenticated and reset IPA firmware \"%s\"\n", path);
++	}
+ 
+ 	memunmap(virt);
+ out_release_firmware:
+@@ -651,6 +691,10 @@
+ 	},
+ 	{
+ 		.compatible	= "qcom,sdx55-ipa",
++		.data		= &ipa_data_v4_5,
++	},
++	{
++		.compatible	= "qcom,sm8250-ipa",
+ 		.data		= &ipa_data_v4_5,
+ 	},
+ 	{
+@@ -897,15 +941,22 @@
+ 
+ 	if (loader == IPA_LOADER_SELF) {
+ 		/* The AP is loading GSI firmware; do so now */
++		dev_info(dev, "IPA GSI loader is self; loading firmware from AP\n");
+ 		ret = ipa_firmware_load(dev);
+-		if (ret)
++		if (ret) {
++			dev_err(dev, "IPA firmware load failed: %d\n", ret);
+ 			goto err_deconfig;
++		}
++		dev_info(dev, "IPA firmware load finished\n");
+ 	} /* Otherwise loader == IPA_LOADER_SKIP */
+ 
+ 	/* GSI firmware is loaded; proceed to setup */
++	dev_info(dev, "starting IPA setup\n");
+ 	ret = ipa_setup(ipa);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "IPA setup failed: %d\n", ret);
+ 		goto err_deconfig;
++	}
+ done:
+ 	(void)pm_runtime_put_autosuspend(dev);
+ 
+--- a/drivers/net/ipa/ipa_mem.c
++++ b/drivers/net/ipa/ipa_mem.c
+@@ -85,12 +85,13 @@
+ 	u16 size;
+ 	u32 val;
+ 
+-	/* Get a transaction to define the header memory region and to zero
+-	 * the processing context and modem memory regions.
++	/* Vendor Kona IPA setup sends HDR_INIT_LOCAL as its own immediate
++	 * command before issuing DMA_SHARED_MEM zeroing commands.  Keep the
++	 * same ordering here while debugging SM8250 APQ bring-up.
+ 	 */
+-	trans = ipa_cmd_trans_alloc(ipa, 4);
++	trans = ipa_cmd_trans_alloc(ipa, 1);
+ 	if (!trans) {
+-		dev_err(ipa->dev, "no transaction for memory setup\n");
++		dev_err(ipa->dev, "no transaction for header memory setup\n");
+ 		return -EBUSY;
+ 	}
+ 
+@@ -105,13 +106,28 @@
+ 	if (mem)
+ 		size += mem->size;
+ 
++	dev_info(ipa->dev,
++		 "ipa_mem_setup: HDR_INIT_LOCAL offset=0x%08x size=0x%04x dma=%pad\n",
++		 offset + ipa->mem_offset, size, &addr);
+ 	ipa_cmd_hdr_init_local_add(trans, offset, size, addr);
+-
++	dev_info(ipa->dev, "ipa_mem_setup: waiting for HDR_INIT_LOCAL completion\n");
++	gsi_trans_commit_wait(trans);
++	dev_info(ipa->dev, "ipa_mem_setup: HDR_INIT_LOCAL completed\n");
++
++	trans = ipa_cmd_trans_alloc(ipa, 3);
++	if (!trans) {
++		dev_err(ipa->dev, "no transaction for memory zero setup\n");
++		return -EBUSY;
++	}
++
++	dev_info(ipa->dev, "ipa_mem_setup: zero modem/app proc ctx and modem memory\n");
+ 	ipa_mem_zero_region_add(trans, IPA_MEM_MODEM_PROC_CTX);
+ 	ipa_mem_zero_region_add(trans, IPA_MEM_AP_PROC_CTX);
+ 	ipa_mem_zero_region_add(trans, IPA_MEM_MODEM);
+ 
++	dev_info(ipa->dev, "ipa_mem_setup: waiting for memory zero completion\n");
+ 	gsi_trans_commit_wait(trans);
++	dev_info(ipa->dev, "ipa_mem_setup: memory zero completed\n");
+ 
+ 	/* Tell the hardware where the processing context area is located */
+ 	mem = ipa_mem_find(ipa, IPA_MEM_MODEM_PROC_CTX);
+@@ -119,6 +135,9 @@
+ 
+ 	reg = ipa_reg(ipa, LOCAL_PKT_PROC_CNTXT);
+ 	val = reg_encode(reg, IPA_BASE_ADDR, offset);
++	dev_info(ipa->dev,
++		 "ipa_mem_setup: LOCAL_PKT_PROC_CNTXT offset=0x%08x val=0x%08x\n",
++		 offset, val);
+ 	iowrite32(val, ipa->reg_virt + reg_offset(reg));
+ 
+ 	return 0;
+--- /dev/null
++++ b/drivers/net/ipa/ipa_mhi.c
+@@ -0,0 +1,933 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/* Copyright (C) 2026 Linaro Ltd. */
++
++#include <linux/bitfield.h>
++#include <linux/dma-direction.h>
++#include <linux/errno.h>
++#include <linux/ioport.h>
++#include <linux/iommu.h>
++#include <linux/mhi.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/soc/qcom/qmi.h>
++#include <linux/string.h>
++
++#include "ipa.h"
++#include "ipa_mhi.h"
++#include "ipa_qmi_msg.h"
++#include "ipa_uc.h"
++
++#define IPA_UC_MAILBOX_PHYS_OFFSET	0x000c2000
++#define IPA_UC_MAILBOX_M_STRIDE		0x80
++#define IPA_UC_MAILBOX_N_STRIDE		0x4
++#define IPA_UC_MHI_MBOX_M		1
++#define IPA_UC_MHI_UL_CH_N		0
++#define IPA_UC_MHI_UL_ER_N		1
++#define IPA_UC_MHI_DL_CH_N		2
++#define IPA_UC_MHI_DL_ER_N		3
++
++/* Vendor kona/umi MHI doorbell pages for SDX55 fusion. */
++#define IPA_MHI_CHDB_BASE_DEFAULT	0x64300300
++#define IPA_MHI_ERDB_BASE_DEFAULT	0x64300700
++#define IPA_MHI_DB_STRIDE		8
++#define IPA_MHI_CTRL_IOVA_BASE_DEFAULT	0x00010000
++#define IPA_MHI_CTRL_IOVA_SIZE_DEFAULT	0x0fff0000
++#define IPA_MHI_DATA_IOVA_BASE_DEFAULT	0x10000000
++#define IPA_MHI_DATA_IOVA_SIZE_DEFAULT	0x0fffffff
++
++#define CHAN_CTX_BRSTMODE_MASK		GENMASK(9, 8)
++#define CHAN_CTX_POLLCFG_MASK		GENMASK(15, 10)
++#define EV_CTX_INTMODC_MASK		GENMASK(15, 8)
++#define EV_CTX_INTMODT_MASK		GENMASK(31, 16)
++
++struct ipa_mhi_chan_ctxt {
++	__le32 chcfg;
++	__le32 chtype;
++	__le32 erindex;
++	__le64 rbase __packed __aligned(4);
++	__le64 rlen __packed __aligned(4);
++	__le64 rp __packed __aligned(4);
++	__le64 wp __packed __aligned(4);
++};
++
++struct ipa_mhi_event_ctxt {
++	__le32 intmod;
++	__le32 ertype;
++	__le32 msivec;
++	__le64 rbase __packed __aligned(4);
++	__le64 rlen __packed __aligned(4);
++	__le64 rp __packed __aligned(4);
++	__le64 wp __packed __aligned(4);
++};
++
++struct ipa_mhi_state {
++	struct mutex mutex;
++	struct ipa *ipa;
++	struct mhi_device *mhi_dev;
++	struct sockaddr_qrtr modem_sq;
++	struct sockaddr_qrtr modem_sq_alt;
++	bool have_modem_alt;
++	u32 ul_chan;
++	u32 dl_chan;
++	u32 ul_er;
++	u32 dl_er;
++	u32 chdb_base;
++	u32 erdb_base;
++	u64 ctrl_iova_base;
++	u64 ctrl_iova_size;
++	u64 data_iova_base;
++	u64 data_iova_size;
++	struct ipa_mhi_alloc_channel_req alloc_req;
++	struct ipa_mhi_mem_addr_info ctrl_map[IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX];
++	struct ipa_mhi_mem_addr_info data_map[IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX];
++	u32 ctrl_map_len;
++	u32 data_map_len;
++	unsigned long db_iova;
++	size_t db_size;
++	bool have_ipa;
++	bool have_mhi;
++	bool have_modem;
++	bool ready_sent;
++	bool smmu_mapped;
++	bool db_mapped;
++	bool registered;
++};
++
++static struct ipa_mhi_state ipa_mhi_state;
++static struct mhi_driver ipa_mhi_driver;
++
++static u32 ipa_mhi_mailbox_addr(struct ipa *ipa, u32 n)
++{
++	struct platform_device *pdev = to_platform_device(ipa->dev);
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ipa-reg");
++	if (!res)
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return 0;
++
++	return lower_32_bits(res->start + IPA_UC_MAILBOX_PHYS_OFFSET +
++			    IPA_UC_MAILBOX_M_STRIDE * IPA_UC_MHI_MBOX_M +
++			    IPA_UC_MAILBOX_N_STRIDE * n);
++}
++
++static __maybe_unused int ipa_mhi_map_doorbells(struct ipa_mhi_state *state)
++{
++	struct ipa *ipa = state->ipa;
++	int ret;
++
++	ret = ipa_uc_mhi_remote_info(ipa,
++				     state->chdb_base +
++				     state->ul_chan * IPA_MHI_DB_STRIDE,
++				     IPA_UC_MHI_UL_CH_N);
++	if (ret) {
++		dev_err(ipa->dev, "REMOTE_IPA_INFO UL channel failed: %d\n",
++			ret);
++		return ret;
++	}
++
++	ret = ipa_uc_mhi_remote_info(ipa,
++				     state->erdb_base +
++				     state->ul_er * IPA_MHI_DB_STRIDE,
++				     IPA_UC_MHI_UL_ER_N);
++	if (ret) {
++		dev_err(ipa->dev, "REMOTE_IPA_INFO UL event failed: %d\n",
++			ret);
++		return ret;
++	}
++
++	ret = ipa_uc_mhi_remote_info(ipa,
++				     state->chdb_base +
++				     state->dl_chan * IPA_MHI_DB_STRIDE,
++				     IPA_UC_MHI_DL_CH_N);
++	if (ret) {
++		dev_err(ipa->dev, "REMOTE_IPA_INFO DL channel failed: %d\n",
++			ret);
++		return ret;
++	}
++
++	ret = ipa_uc_mhi_remote_info(ipa,
++				     state->erdb_base +
++				     state->dl_er * IPA_MHI_DB_STRIDE,
++				     IPA_UC_MHI_DL_ER_N);
++	if (ret) {
++		dev_err(ipa->dev, "REMOTE_IPA_INFO DL event failed: %d\n",
++			ret);
++		return ret;
++	}
++
++	dev_info(ipa->dev,
++		 "REMOTE_IPA_INFO mapped chdb=0x%08x erdb=0x%08x for channels %u/%u events %u/%u\n",
++		 state->chdb_base, state->erdb_base, state->ul_chan,
++		 state->dl_chan, state->ul_er, state->dl_er);
++
++	return 0;
++}
++
++static void ipa_mhi_round_db_window(struct ipa_mhi_state *state,
++				    unsigned long *iova, phys_addr_t *pa,
++				    size_t *size)
++{
++	u32 start = min(state->chdb_base, state->erdb_base);
++	u32 end = max(state->chdb_base, state->erdb_base) + PAGE_SIZE;
++
++	*iova = start & PAGE_MASK;
++	*pa = start & PAGE_MASK;
++	*size = PAGE_ALIGN(end - *iova);
++}
++
++static int ipa_mhi_map_uc_doorbells(struct ipa_mhi_state *state)
++{
++	struct iommu_domain *domain;
++	struct ipa *ipa = state->ipa;
++	unsigned long iova;
++	phys_addr_t pa;
++	size_t size;
++	int ret;
++
++	if (state->db_mapped)
++		return 0;
++
++	domain = iommu_get_domain_for_dev(ipa->dev);
++	if (!domain)
++		return -EINVAL;
++
++	ipa_mhi_round_db_window(state, &iova, &pa, &size);
++
++	ret = iommu_map(domain, iova, pa, size,
++			IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO, GFP_KERNEL);
++	if (ret) {
++		dev_err(ipa->dev,
++			"failed to map IPA uC MHI doorbell page iova=0x%lx pa=%pa size=0x%zx ret=%d\n",
++			iova, &pa, size, ret);
++		return ret;
++	}
++
++	state->db_iova = iova;
++	state->db_size = size;
++	state->db_mapped = true;
++
++	dev_info(ipa->dev,
++		 "mapped IPA uC MHI doorbell page iova=0x%lx pa=%pa size=0x%zx\n",
++		 iova, &pa, size);
++
++	return 0;
++}
++
++static void ipa_mhi_unmap_uc_doorbells(struct ipa_mhi_state *state)
++{
++	struct iommu_domain *domain;
++
++	if (!state->db_mapped || !state->ipa)
++		return;
++
++	domain = iommu_get_domain_for_dev(state->ipa->dev);
++	if (domain)
++		iommu_unmap(domain, state->db_iova, state->db_size);
++
++	state->db_mapped = false;
++	state->db_iova = 0;
++	state->db_size = 0;
++}
++
++static int ipa_mhi_send_ready_locked(struct ipa_mhi_state *state)
++{
++	struct ipa_mhi_ready_ind ind = { };
++	struct qmi_handle *qmi;
++	struct ipa *ipa = state->ipa;
++	int ret;
++
++	if (!state->have_ipa || !state->have_mhi || !state->have_modem)
++		return 0;
++	if (state->ready_sent)
++		return 0;
++
++	if (state->ul_chan == U32_MAX || state->dl_chan == U32_MAX ||
++	    state->ul_er == U32_MAX || state->dl_er == U32_MAX)
++		return -ENODEV;
++
++	/* The IPA microcontroller never posts INIT_COMPLETED on the SDX55
++	 * fusion target (umi's ipa_fws.mdt does not include a running uC),
++	 * so we cannot use the uC mailbox proxy that
++	 * ipa_mhi_map_doorbells/REMOTE_IPA_INFO would set up.  Send the
++	 * indication with the mailbox addresses anyway — the modem firmware's
++	 * MCFG-Refresh-STM watchdog appears to gate on receiving MHI_READY
++	 * itself, not on the doorbell-translation path being functional.
++	 */
++	ret = ipa_mhi_map_uc_doorbells(state);
++	if (ret)
++		dev_warn(ipa->dev,
++			 "error %d mapping IPA uC doorbell window (continuing)\n",
++			 ret);
++
++	ind.ch_info_arr_len = 2;
++	ind.ch_info_arr[0].ch_id = state->ul_chan;
++	ind.ch_info_arr[0].er_id = state->ul_er;
++	ind.ch_info_arr[0].direction_type = DMA_TO_DEVICE;
++	ind.ch_info_arr[0].ch_doorbell_addr =
++		ipa_mhi_mailbox_addr(ipa, IPA_UC_MHI_UL_CH_N);
++	ind.ch_info_arr[0].er_doorbell_addr =
++		ipa_mhi_mailbox_addr(ipa, IPA_UC_MHI_UL_ER_N);
++
++	ind.ch_info_arr[1].ch_id = state->dl_chan;
++	ind.ch_info_arr[1].er_id = state->dl_er;
++	ind.ch_info_arr[1].direction_type = DMA_FROM_DEVICE;
++	ind.ch_info_arr[1].ch_doorbell_addr =
++		ipa_mhi_mailbox_addr(ipa, IPA_UC_MHI_DL_CH_N);
++	ind.ch_info_arr[1].er_doorbell_addr =
++		ipa_mhi_mailbox_addr(ipa, IPA_UC_MHI_DL_ER_N);
++
++	ind.smmu_info_valid = true;
++	ind.smmu_info.iova_ctl_base_addr = state->ctrl_iova_base;
++	ind.smmu_info.iova_ctl_size = state->ctrl_iova_size;
++	ind.smmu_info.iova_data_base_addr = state->data_iova_base;
++	ind.smmu_info.iova_data_size = state->data_iova_size;
++
++	qmi = &ipa->qmi.server_handle;
++	ret = qmi_send_indication(qmi, &state->modem_sq, IPA_QMI_MHI_READY,
++				  IPA_QMI_MHI_READY_IND_SZ,
++				  ipa_mhi_ready_ind_ei, &ind);
++	if (ret) {
++		dev_err(ipa->dev, "error %d sending MHI ready indication\n",
++			ret);
++		return ret;
++	}
++
++	state->ready_sent = true;
++	dev_info(ipa->dev,
++		 "sent IPA MHI ready indication for channels %u/%u events %u/%u ctrl_iova=0x%llx+0x%llx data_iova=0x%llx+0x%llx\n",
++		 state->ul_chan, state->dl_chan, state->ul_er, state->dl_er,
++		 state->ctrl_iova_base, state->ctrl_iova_size,
++		 state->data_iova_base, state->data_iova_size);
++
++	/* On the fusion target the modem accepts MHI_READY but never sends
++	 * INDICATION_REGISTER, so the upstream INIT_COMPLETE-on-request path
++	 * is never taken.  Send INIT_COMPLETE unconditionally here — the
++	 * modem's MCFG-Refresh-STM watchdog appears to wait for it after
++	 * MHI_READY before continuing mission-mode bringup.
++	 *
++	 * SDX55 fusion publishes IPA on two PD instances; deliver
++	 * INIT_COMPLETE to both so neither modem-PD task starves.
++	 */
++	{
++		struct ipa_init_complete_ind init_ind = { };
++
++		init_ind.status.result = QMI_RESULT_SUCCESS_V01;
++		init_ind.status.error = QMI_ERR_NONE_V01;
++		ret = qmi_send_indication(qmi, &state->modem_sq,
++					  IPA_QMI_INIT_COMPLETE,
++					  IPA_QMI_INIT_COMPLETE_IND_SZ,
++					  ipa_init_complete_ind_ei,
++					  &init_ind);
++		if (ret)
++			dev_err(ipa->dev,
++				"error %d sending IPA INIT_COMPLETE indication\n",
++				ret);
++		else
++			dev_info(ipa->dev,
++				 "sent IPA INIT_COMPLETE indication after MHI ready\n");
++
++		if (state->have_modem_alt) {
++			ret = qmi_send_indication(qmi, &state->modem_sq_alt,
++						  IPA_QMI_INIT_COMPLETE,
++						  IPA_QMI_INIT_COMPLETE_IND_SZ,
++						  ipa_init_complete_ind_ei,
++						  &init_ind);
++			if (ret)
++				dev_err(ipa->dev,
++					"error %d sending alt IPA INIT_COMPLETE\n",
++					ret);
++			else
++				dev_info(ipa->dev,
++					 "sent IPA INIT_COMPLETE to alt PD %u:%u\n",
++					 state->modem_sq_alt.sq_node,
++					 state->modem_sq_alt.sq_port);
++		}
++	}
++
++	return 0;
++}
++
++int ipa_mhi_send_ready(struct ipa *ipa)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++	int ret;
++
++	/* The proxy state mutex is only initialized when ipa_mhi_setup()
++	 * matched a fusion compatible.  Skip cleanly otherwise so the
++	 * uc-loaded retry hook is safe on non-fusion hardware.
++	 */
++	if (!state->have_ipa)
++		return 0;
++
++	mutex_lock(&state->mutex);
++	ret = ipa_mhi_send_ready_locked(state);
++	mutex_unlock(&state->mutex);
++
++	return ret;
++}
++
++void ipa_mhi_modem_server(struct ipa *ipa, struct sockaddr_qrtr *sq)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++
++	mutex_lock(&state->mutex);
++	state->modem_sq = *sq;
++	state->have_modem = true;
++	state->ready_sent = false;
++	mutex_unlock(&state->mutex);
++}
++
++void ipa_mhi_modem_server_alt(struct ipa *ipa, struct sockaddr_qrtr *sq)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++	struct ipa_init_complete_ind init_ind = { };
++	struct qmi_handle *qmi;
++	bool send_now = false;
++	int ret;
++
++	mutex_lock(&state->mutex);
++	state->modem_sq_alt = *sq;
++	state->have_modem_alt = true;
++	/*
++	 * If the primary handshake already completed (modem PDs published in
++	 * different order than expected), send the alt INIT_COMPLETE here.
++	 */
++	if (state->ready_sent)
++		send_now = true;
++	mutex_unlock(&state->mutex);
++
++	if (!send_now)
++		return;
++
++	qmi = &ipa->qmi.server_handle;
++	init_ind.status.result = QMI_RESULT_SUCCESS_V01;
++	init_ind.status.error = QMI_ERR_NONE_V01;
++	ret = qmi_send_indication(qmi, &state->modem_sq_alt,
++				  IPA_QMI_INIT_COMPLETE,
++				  IPA_QMI_INIT_COMPLETE_IND_SZ,
++				  ipa_init_complete_ind_ei,
++				  &init_ind);
++	if (ret)
++		dev_err(ipa->dev,
++			"error %d sending late alt IPA INIT_COMPLETE\n", ret);
++	else
++		dev_info(ipa->dev,
++			 "sent late IPA INIT_COMPLETE to alt PD %u:%u\n",
++			 sq->sq_node, sq->sq_port);
++}
++
++int ipa_mhi_modem_ready(struct ipa *ipa)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++	bool need_register = false;
++	int ret = 0;
++
++	if (!of_device_is_compatible(ipa->dev->of_node, "qcom,sm8250-ipa"))
++		return 0;
++
++	mutex_lock(&state->mutex);
++	state->ready_sent = false;
++	if (!state->registered) {
++		state->registered = true;
++		need_register = true;
++	}
++	mutex_unlock(&state->mutex);
++
++	if (need_register) {
++		ret = mhi_driver_register(&ipa_mhi_driver);
++		if (ret) {
++			dev_err(ipa->dev,
++				"failed to register IPA MHI proxy driver: %d\n",
++				ret);
++			mutex_lock(&state->mutex);
++			state->registered = false;
++			mutex_unlock(&state->mutex);
++			return ret;
++		}
++		dev_info(ipa->dev, "IPA MHI proxy driver registered\n");
++	}
++
++	/* MHI device may already be present (probe fired previously); try
++	 * to send the ready indication now in case all preconditions are met.
++	 */
++	return ipa_mhi_send_ready(ipa);
++}
++
++void ipa_mhi_modem_shutdown(struct ipa *ipa)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++	bool unregister = false;
++
++	mutex_lock(&state->mutex);
++	state->have_modem = false;
++	state->ready_sent = false;
++	if (state->registered) {
++		state->registered = false;
++		unregister = true;
++	}
++	mutex_unlock(&state->mutex);
++
++	if (unregister)
++		mhi_driver_unregister(&ipa_mhi_driver);
++}
++
++static const struct ipa_mhi_er_info *
++ipa_mhi_find_er(const struct ipa_mhi_alloc_channel_req *req, u8 er_id)
++{
++	u32 i;
++
++	for (i = 0; i < req->er_info_arr_len; i++)
++		if (req->er_info_arr[i].er_id == er_id)
++			return &req->er_info_arr[i];
++
++	return NULL;
++}
++
++static u32 ipa_mhi_brstmode(u32 mode)
++{
++	if (mode == IPA_MHI_BRST_MODE_ENABLED)
++		return 3;
++	if (mode == IPA_MHI_BRST_MODE_DISABLED)
++		return 2;
++
++	return 0;
++}
++
++static void ipa_mhi_round_mapping(const struct ipa_mhi_mem_addr_info *map,
++				  unsigned long *iova, phys_addr_t *pa,
++				  size_t *size)
++{
++	*iova = map->iova & PAGE_MASK;
++	*pa = map->pa & PAGE_MASK;
++	*size = PAGE_ALIGN(map->size + map->pa - *pa);
++}
++
++static int ipa_mhi_map_one(struct ipa_mhi_state *state,
++			   const struct ipa_mhi_mem_addr_info *map,
++			   bool map_it)
++{
++	struct iommu_domain *domain;
++	unsigned long iova;
++	phys_addr_t pa;
++	size_t size;
++	int prot;
++	int ret;
++
++	domain = iommu_get_domain_for_dev(state->mhi_dev->dev.parent);
++	if (!domain)
++		return -EINVAL;
++
++	ipa_mhi_round_mapping(map, &iova, &pa, &size);
++	if (!size)
++		return -EINVAL;
++
++	if (!map_it) {
++		iommu_unmap(domain, iova, size);
++		return 0;
++	}
++
++	prot = IOMMU_READ | IOMMU_WRITE;
++	if (pa >= 0x1e40000 && pa < 0x1e40000 + 0x100000)
++		prot |= IOMMU_MMIO;
++
++	ret = iommu_map(domain, iova, pa, size, prot, GFP_KERNEL);
++	if (!ret && state->ipa)
++		dev_info(state->ipa->dev,
++			 "mapped IPA MHI SMMU iova=0x%lx pa=%pa size=0x%zx prot=0x%x\n",
++			 iova, &pa, size, prot);
++	else if (ret && state->ipa)
++		dev_err(state->ipa->dev,
++			"failed IPA MHI SMMU map iova=0x%lx pa=%pa size=0x%zx ret=%d\n",
++			iova, &pa, size, ret);
++
++	return ret;
++}
++
++static int ipa_mhi_map_smmu(struct ipa_mhi_state *state,
++			    const struct ipa_mhi_alloc_channel_req *req)
++{
++	u32 i;
++	int ret;
++
++	if (state->smmu_mapped)
++		return 0;
++
++	if (req->ctrl_addr_map_info_len > IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX ||
++	    req->data_addr_map_info_len > IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX)
++		return -EINVAL;
++
++	state->ctrl_map_len = req->ctrl_addr_map_info_len;
++	state->data_map_len = req->data_addr_map_info_len;
++	memcpy(state->ctrl_map, req->ctrl_addr_map_info,
++	       sizeof(state->ctrl_map[0]) * state->ctrl_map_len);
++	memcpy(state->data_map, req->data_addr_map_info,
++	       sizeof(state->data_map[0]) * state->data_map_len);
++
++	for (i = 0; i < state->ctrl_map_len; i++) {
++		ret = ipa_mhi_map_one(state, &state->ctrl_map[i], true);
++		if (ret)
++			goto err_unmap_ctrl;
++	}
++
++	for (i = 0; i < state->data_map_len; i++) {
++		ret = ipa_mhi_map_one(state, &state->data_map[i], true);
++		if (ret)
++			goto err_unmap_data;
++	}
++
++	state->smmu_mapped = true;
++	return 0;
++
++err_unmap_data:
++	while (i--)
++		ipa_mhi_map_one(state, &state->data_map[i], false);
++	i = state->ctrl_map_len;
++err_unmap_ctrl:
++	while (i--)
++		ipa_mhi_map_one(state, &state->ctrl_map[i], false);
++	state->ctrl_map_len = 0;
++	state->data_map_len = 0;
++	return ret;
++}
++
++static void ipa_mhi_unmap_smmu(struct ipa_mhi_state *state)
++{
++	u32 i;
++
++	if (!state->smmu_mapped)
++		return;
++
++	for (i = 0; i < state->data_map_len; i++)
++		ipa_mhi_map_one(state, &state->data_map[i], false);
++	for (i = 0; i < state->ctrl_map_len; i++)
++		ipa_mhi_map_one(state, &state->ctrl_map[i], false);
++
++	state->ctrl_map_len = 0;
++	state->data_map_len = 0;
++	state->smmu_mapped = false;
++}
++
++static int ipa_mhi_configure_one(struct ipa_mhi_state *state,
++				 const struct ipa_mhi_tr_info *tr,
++				 struct ipa_mhi_ch_alloc_resp *ch_rsp)
++{
++	struct ipa_mhi_chan_ctxt ch_ctxt = { };
++	struct ipa_mhi_event_ctxt er_ctxt = { };
++	const struct ipa_mhi_er_info *er;
++	struct mhi_buf cfg[2];
++	enum dma_data_direction dir;
++	u32 er_id;
++	u32 chcfg;
++	int ret;
++
++	if (tr->ch_id == state->ul_chan) {
++		dir = DMA_TO_DEVICE;
++		er_id = state->ul_er;
++	} else if (tr->ch_id == state->dl_chan) {
++		dir = DMA_FROM_DEVICE;
++		er_id = state->dl_er;
++	} else {
++		ch_rsp->ch_id = tr->ch_id;
++		ch_rsp->is_success = 0;
++		return -EINVAL;
++	}
++
++	er = ipa_mhi_find_er(&state->alloc_req, er_id);
++	if (!er) {
++		ch_rsp->ch_id = tr->ch_id;
++		ch_rsp->is_success = 0;
++		return -EINVAL;
++	}
++
++	chcfg = FIELD_PREP(CHAN_CTX_BRSTMODE_MASK,
++			   ipa_mhi_brstmode(tr->brst_mode_type));
++	chcfg |= FIELD_PREP(CHAN_CTX_POLLCFG_MASK, tr->poll_cfg);
++	ch_ctxt.chcfg = cpu_to_le32(chcfg);
++	ch_ctxt.chtype = cpu_to_le32(dir);
++	ch_ctxt.erindex = cpu_to_le32(er_id);
++	ch_ctxt.rbase = cpu_to_le64(tr->ring_iova);
++	ch_ctxt.rlen = cpu_to_le64(tr->ring_len);
++	ch_ctxt.rp = cpu_to_le64(tr->rp);
++	ch_ctxt.wp = cpu_to_le64(tr->wp);
++
++	er_ctxt.intmod = cpu_to_le32(FIELD_PREP(EV_CTX_INTMODC_MASK,
++						er->intmod_count) |
++				     FIELD_PREP(EV_CTX_INTMODT_MASK,
++						er->intmod_cycles));
++	er_ctxt.ertype = cpu_to_le32(1);
++	er_ctxt.msivec = cpu_to_le32(er->msi_addr);
++	er_ctxt.rbase = cpu_to_le64(er->ring_iova);
++	er_ctxt.rlen = cpu_to_le64(er->ring_len);
++	er_ctxt.rp = cpu_to_le64(er->rp);
++	er_ctxt.wp = cpu_to_le64(er->wp);
++
++	cfg[0].buf = &ch_ctxt;
++	cfg[0].name = "CCA";
++	cfg[0].len = sizeof(ch_ctxt);
++	cfg[1].buf = &er_ctxt;
++	cfg[1].name = "ECA";
++	cfg[1].len = sizeof(er_ctxt);
++
++	ret = mhi_device_configure(state->mhi_dev, dir, cfg, ARRAY_SIZE(cfg));
++	ch_rsp->ch_id = tr->ch_id;
++	ch_rsp->is_success = !ret;
++	if (!ret && state->ipa)
++		dev_info(state->ipa->dev,
++			 "configured remote MHI channel %u event %u ring=0x%llx len=0x%llx\n",
++			 tr->ch_id, er_id, tr->ring_iova, tr->ring_len);
++
++	return ret;
++}
++
++void ipa_mhi_alloc_channel(struct ipa *ipa,
++			   const struct ipa_mhi_alloc_channel_req *req,
++			   struct ipa_mhi_alloc_channel_rsp *rsp)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++	u32 i;
++	int ret = 0;
++
++	memset(rsp, 0, sizeof(*rsp));
++	rsp->rsp.result = QMI_RESULT_FAILURE_V01;
++	rsp->rsp.error = QMI_ERR_INTERNAL_V01;
++
++	mutex_lock(&state->mutex);
++	if (!state->have_mhi || !state->ready_sent || !state->mhi_dev) {
++		rsp->rsp.error = QMI_ERR_MALFORMED_MSG_V01;
++		goto out_unlock;
++	}
++
++	state->alloc_req = *req;
++
++	if (req->tr_info_arr_len > IPA_QMI_REMOTE_MHI_CHANNELS_MAX ||
++	    req->er_info_arr_len > IPA_QMI_REMOTE_MHI_CHANNELS_MAX ||
++	    req->ctrl_addr_map_info_len > IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX ||
++	    req->data_addr_map_info_len > IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX) {
++		rsp->rsp.error = QMI_ERR_MALFORMED_MSG_V01;
++		goto out_unlock;
++	}
++
++	ret = ipa_mhi_map_smmu(state, req);
++	if (ret) {
++		dev_err(ipa->dev, "error %d mapping IPA MHI SMMU windows\n",
++			ret);
++		rsp->rsp.error = QMI_ERR_INTERNAL_V01;
++		goto out_unlock;
++	}
++
++	rsp->alloc_resp_arr_valid = true;
++	for (i = 0; i < req->tr_info_arr_len; i++) {
++		struct ipa_mhi_ch_alloc_resp *ch_rsp;
++
++		ch_rsp = &rsp->alloc_resp_arr[rsp->alloc_resp_arr_len++];
++		ret = ipa_mhi_configure_one(state, &req->tr_info_arr[i],
++					    ch_rsp);
++		if (ret)
++			goto out_unlock;
++	}
++
++	ret = mhi_prepare_for_transfer(state->mhi_dev);
++	if (ret) {
++		rsp->rsp.error = QMI_ERR_MALFORMED_MSG_V01;
++		goto out_unlock;
++	}
++
++	rsp->rsp.result = QMI_RESULT_SUCCESS_V01;
++	rsp->rsp.error = QMI_ERR_NONE_V01;
++	dev_info(ipa->dev, "configured IPA MHI offload channels\n");
++
++out_unlock:
++	if (ret && state->smmu_mapped)
++		ipa_mhi_unmap_smmu(state);
++	mutex_unlock(&state->mutex);
++}
++
++void ipa_mhi_clk_vote(struct ipa *ipa,
++		      const struct ipa_mhi_clk_vote_req *req,
++		      struct ipa_mhi_clk_vote_rsp *rsp)
++{
++	memset(rsp, 0, sizeof(*rsp));
++	rsp->rsp.result = QMI_RESULT_SUCCESS_V01;
++	rsp->rsp.error = QMI_ERR_NONE_V01;
++	dev_dbg(ipa->dev, "IPA MHI clock vote %u rate_valid=%u rate=%u\n",
++		req->mhi_vote, req->clk_rate_valid, req->clk_rate);
++}
++
++/* The fusion MHI controller config (drivers/bus/mhi/host/pci_generic.c
++ * modem_qcom_sdx55_fusion_channels) defines IP_HW_MHIP_0 as offload
++ * channel pair 105/106 routed through event rings 11/12.  The upstream
++ * struct mhi_device only exposes ul_chan_id/dl_chan_id; the event ring
++ * indices live in the private mhi_chan struct, so we hardcode them here
++ * to match the controller config.
++ */
++#define IPA_MHI_PROXY_CHAN	"IP_HW_MHIP_0"
++#define IPA_MHI_PROXY_UL_CH	105
++#define IPA_MHI_PROXY_DL_CH	106
++#define IPA_MHI_PROXY_UL_ER	11
++#define IPA_MHI_PROXY_DL_ER	12
++
++static int ipa_mhi_probe(struct mhi_device *mhi_dev,
++			 const struct mhi_device_id *id)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++	int ret;
++
++	if (!state->ipa)
++		return -ENODEV;
++
++	mutex_lock(&state->mutex);
++
++	if (state->mhi_dev) {
++		dev_info(state->ipa->dev,
++			 "IPA MHI proxy already bound; ignoring extra %s bind\n",
++			 id->chan);
++		mutex_unlock(&state->mutex);
++		return -EBUSY;
++	}
++
++	if (mhi_dev->ul_chan_id != IPA_MHI_PROXY_UL_CH ||
++	    mhi_dev->dl_chan_id != IPA_MHI_PROXY_DL_CH) {
++		dev_err(state->ipa->dev,
++			"unexpected MHI proxy channels ul=%d dl=%d\n",
++			mhi_dev->ul_chan_id, mhi_dev->dl_chan_id);
++		mutex_unlock(&state->mutex);
++		return -EINVAL;
++	}
++
++	state->mhi_dev = mhi_dev;
++	state->ul_chan = mhi_dev->ul_chan_id;
++	state->dl_chan = mhi_dev->dl_chan_id;
++	state->ul_er = IPA_MHI_PROXY_UL_ER;
++	state->dl_er = IPA_MHI_PROXY_DL_ER;
++	state->have_mhi = true;
++
++	dev_info(state->ipa->dev,
++		 "IPA MHI proxy bound %s: ul_chan=%u dl_chan=%u ul_er=%u dl_er=%u\n",
++		 id->chan, state->ul_chan, state->dl_chan,
++		 state->ul_er, state->dl_er);
++
++	ret = ipa_mhi_send_ready_locked(state);
++	if (ret) {
++		dev_err(state->ipa->dev,
++			"error %d sending MHI ready from probe\n", ret);
++		state->mhi_dev = NULL;
++		state->have_mhi = false;
++	}
++	mutex_unlock(&state->mutex);
++
++	return ret;
++}
++
++static void ipa_mhi_remove(struct mhi_device *mhi_dev)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++
++	mutex_lock(&state->mutex);
++	if (state->mhi_dev == mhi_dev) {
++		ipa_mhi_unmap_uc_doorbells(state);
++		ipa_mhi_unmap_smmu(state);
++		state->mhi_dev = NULL;
++		state->have_mhi = false;
++		state->ready_sent = false;
++	}
++	mutex_unlock(&state->mutex);
++}
++
++static const struct mhi_device_id ipa_mhi_match_table[] = {
++	{ .chan = IPA_MHI_PROXY_CHAN },
++	{ },
++};
++
++static struct mhi_driver ipa_mhi_driver = {
++	.id_table = ipa_mhi_match_table,
++	.probe = ipa_mhi_probe,
++	.remove = ipa_mhi_remove,
++	.driver = {
++		.name = "ipa_mhi_proxy",
++		.owner = THIS_MODULE,
++	},
++};
++
++int ipa_mhi_setup(struct ipa *ipa)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++
++	if (!of_device_is_compatible(ipa->dev->of_node, "qcom,sm8250-ipa"))
++		return 0;
++
++	mutex_init(&state->mutex);
++	mutex_lock(&state->mutex);
++	state->ipa = ipa;
++	state->have_ipa = true;
++	state->have_modem = false;
++	state->ready_sent = false;
++	state->ctrl_map_len = 0;
++	state->data_map_len = 0;
++	state->smmu_mapped = false;
++	state->db_mapped = false;
++	state->db_iova = 0;
++	state->db_size = 0;
++	state->registered = false;
++	state->chdb_base = IPA_MHI_CHDB_BASE_DEFAULT;
++	state->erdb_base = IPA_MHI_ERDB_BASE_DEFAULT;
++	state->ctrl_iova_base = IPA_MHI_CTRL_IOVA_BASE_DEFAULT;
++	state->ctrl_iova_size = IPA_MHI_CTRL_IOVA_SIZE_DEFAULT;
++	state->data_iova_base = IPA_MHI_DATA_IOVA_BASE_DEFAULT;
++	state->data_iova_size = IPA_MHI_DATA_IOVA_SIZE_DEFAULT;
++	of_property_read_u32(ipa->dev->of_node, "qcom,mhi-chdb-base",
++			     &state->chdb_base);
++	of_property_read_u32(ipa->dev->of_node, "qcom,mhi-erdb-base",
++			     &state->erdb_base);
++	of_property_read_u64(ipa->dev->of_node, "qcom,ctrl-iova-base",
++			     &state->ctrl_iova_base);
++	of_property_read_u64(ipa->dev->of_node, "qcom,ctrl-iova-size",
++			     &state->ctrl_iova_size);
++	of_property_read_u64(ipa->dev->of_node, "qcom,data-iova-base",
++			     &state->data_iova_base);
++	of_property_read_u64(ipa->dev->of_node, "qcom,data-iova-size",
++			     &state->data_iova_size);
++	mutex_unlock(&state->mutex);
++
++	return 0;
++}
++
++void ipa_mhi_teardown(struct ipa *ipa)
++{
++	struct ipa_mhi_state *state = &ipa_mhi_state;
++	bool unregister = false;
++
++	if (!of_device_is_compatible(ipa->dev->of_node, "qcom,sm8250-ipa"))
++		return;
++
++	mutex_lock(&state->mutex);
++	if (state->registered) {
++		state->registered = false;
++		unregister = true;
++	}
++	mutex_unlock(&state->mutex);
++
++	if (unregister)
++		mhi_driver_unregister(&ipa_mhi_driver);
++
++	mutex_lock(&state->mutex);
++	ipa_mhi_unmap_uc_doorbells(state);
++	state->ipa = NULL;
++	state->have_ipa = false;
++	state->have_modem = false;
++	state->mhi_dev = NULL;
++	state->have_mhi = false;
++	state->ready_sent = false;
++	state->ctrl_map_len = 0;
++	state->data_map_len = 0;
++	state->smmu_mapped = false;
++	state->db_mapped = false;
++	state->db_iova = 0;
++	state->db_size = 0;
++	mutex_unlock(&state->mutex);
++}
+--- /dev/null
++++ b/drivers/net/ipa/ipa_mhi.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/* Copyright (C) 2026 Linaro Ltd. */
++#ifndef _IPA_MHI_H_
++#define _IPA_MHI_H_
++
++struct ipa;
++struct ipa_mhi_alloc_channel_req;
++struct ipa_mhi_alloc_channel_rsp;
++struct ipa_mhi_clk_vote_req;
++struct ipa_mhi_clk_vote_rsp;
++struct qmi_handle;
++struct sockaddr_qrtr;
++
++int ipa_mhi_setup(struct ipa *ipa);
++void ipa_mhi_teardown(struct ipa *ipa);
++int ipa_mhi_modem_ready(struct ipa *ipa);
++void ipa_mhi_modem_shutdown(struct ipa *ipa);
++void ipa_mhi_modem_server(struct ipa *ipa, struct sockaddr_qrtr *sq);
++void ipa_mhi_modem_server_alt(struct ipa *ipa, struct sockaddr_qrtr *sq);
++int ipa_mhi_send_ready(struct ipa *ipa);
++void ipa_mhi_alloc_channel(struct ipa *ipa,
++			   const struct ipa_mhi_alloc_channel_req *req,
++			   struct ipa_mhi_alloc_channel_rsp *rsp);
++void ipa_mhi_clk_vote(struct ipa *ipa,
++		      const struct ipa_mhi_clk_vote_req *req,
++		      struct ipa_mhi_clk_vote_rsp *rsp);
++
++#endif /* _IPA_MHI_H_ */
+--- a/drivers/net/ipa/ipa_qmi.c
++++ b/drivers/net/ipa/ipa_qmi.c
+@@ -5,10 +5,12 @@
+  */
+ 
+ #include <linux/qrtr.h>
++#include <linux/of.h>
+ #include <linux/string.h>
+ #include <linux/types.h>
+ 
+ #include "ipa.h"
++#include "ipa_mhi.h"
+ #include "ipa_mem.h"
+ #include "ipa_modem.h"
+ #include "ipa_qmi_msg.h"
+@@ -72,6 +74,14 @@
+ 
+ #define IPA_MODEM_SERVICE_SVC_ID	0x31
+ #define IPA_MODEM_SERVICE_INS_ID	2
++/*
++ * SDX55 Fusion publishes IPA on TWO modem PD instances: 1 (modem-PD-A) and
++ * 2 (modem-PD-B / MHI proxy).  Mainline only targeted instance 2; the
++ * modem-PD-A IPA task waits on its own INIT_COMPLETE and starves toward
++ * MISSION+15s.  Add a lookup for the alt instance so we can tell both PDs
++ * the AP IPA driver is up.
++ */
++#define IPA_MODEM_SERVICE_INS_ID_ALT	1
+ #define IPA_MODEM_SVC_VERS		1
+ 
+ #define QMI_INIT_DRIVER_TIMEOUT		60000	/* A minute in milliseconds */
+@@ -142,6 +152,9 @@
+ 
+ 	/* We're ready.  Start up normal operation */
+ 	ipa = container_of(ipa_qmi, struct ipa, qmi);
++	ret = ipa_mhi_modem_ready(ipa);
++	if (ret)
++		dev_err(ipa->dev, "error %d starting IPA MHI proxy\n", ret);
+ 	ret = ipa_modem_start(ipa);
+ 	if (ret)
+ 		dev_err(ipa->dev, "error %d starting modem\n", ret);
+@@ -151,8 +164,10 @@
+ static void ipa_server_bye(struct qmi_handle *qmi, unsigned int node)
+ {
+ 	struct ipa_qmi *ipa_qmi;
++	struct ipa *ipa;
+ 
+ 	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++	ipa = container_of(ipa_qmi, struct ipa, qmi);
+ 
+ 	/* The modem client and server go away at the same time */
+ 	memset(&ipa_qmi->modem_sq, 0, sizeof(ipa_qmi->modem_sq));
+@@ -162,6 +177,8 @@
+ 	ipa_qmi->modem_ready = false;
+ 	ipa_qmi->indication_requested = false;
+ 	ipa_qmi->indication_sent = false;
++
++	ipa_mhi_modem_shutdown(ipa);
+ }
+ 
+ static const struct qmi_ops ipa_server_ops = {
+@@ -229,7 +246,53 @@
+ 	}
+ }
+ 
+-/* The server handles two request message types sent by the modem. */
++static void ipa_server_mhi_alloc_channel(struct qmi_handle *qmi,
++					 struct sockaddr_qrtr *sq,
++					 struct qmi_txn *txn,
++					 const void *decoded)
++{
++	struct ipa_mhi_alloc_channel_rsp rsp;
++	struct ipa_qmi *ipa_qmi;
++	struct ipa *ipa;
++	int ret;
++
++	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++	ipa = container_of(ipa_qmi, struct ipa, qmi);
++
++	ipa_mhi_alloc_channel(ipa, decoded, &rsp);
++
++	ret = qmi_send_response(qmi, sq, txn, IPA_QMI_MHI_ALLOC_CHANNEL,
++				IPA_QMI_MHI_ALLOC_CHANNEL_RSP_SZ,
++				ipa_mhi_alloc_channel_rsp_ei, &rsp);
++	if (ret)
++		dev_err(ipa->dev,
++			"error %d sending MHI alloc channel response\n", ret);
++}
++
++static void ipa_server_mhi_clk_vote(struct qmi_handle *qmi,
++				    struct sockaddr_qrtr *sq,
++				    struct qmi_txn *txn,
++				    const void *decoded)
++{
++	struct ipa_mhi_clk_vote_rsp rsp;
++	struct ipa_qmi *ipa_qmi;
++	struct ipa *ipa;
++	int ret;
++
++	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++	ipa = container_of(ipa_qmi, struct ipa, qmi);
++
++	ipa_mhi_clk_vote(ipa, decoded, &rsp);
++
++	ret = qmi_send_response(qmi, sq, txn, IPA_QMI_MHI_CLK_VOTE,
++				IPA_QMI_MHI_CLK_VOTE_RSP_SZ,
++				ipa_mhi_clk_vote_rsp_ei, &rsp);
++	if (ret)
++		dev_err(ipa->dev,
++			"error %d sending MHI clock vote response\n", ret);
++}
++
++/* The server handles request message types sent by the modem. */
+ static const struct qmi_msg_handler ipa_server_msg_handlers[] = {
+ 	{
+ 		.type		= QMI_REQUEST,
+@@ -245,6 +308,20 @@
+ 		.decoded_size	= IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ,
+ 		.fn		= ipa_server_driver_init_complete,
+ 	},
++	{
++		.type		= QMI_REQUEST,
++		.msg_id		= IPA_QMI_MHI_ALLOC_CHANNEL,
++		.ei		= ipa_mhi_alloc_channel_req_ei,
++		.decoded_size	= sizeof(struct ipa_mhi_alloc_channel_req),
++		.fn		= ipa_server_mhi_alloc_channel,
++	},
++	{
++		.type		= QMI_REQUEST,
++		.msg_id		= IPA_QMI_MHI_CLK_VOTE,
++		.ei		= ipa_mhi_clk_vote_req_ei,
++		.decoded_size	= sizeof(struct ipa_mhi_clk_vote_req),
++		.fn		= ipa_server_mhi_clk_vote,
++	},
+ 	{ },
+ };
+ 
+@@ -448,13 +525,50 @@
+ ipa_client_new_server(struct qmi_handle *qmi, struct qmi_service *svc)
+ {
+ 	struct ipa_qmi *ipa_qmi;
++	struct ipa *ipa;
+ 
+ 	ipa_qmi = container_of(qmi, struct ipa_qmi, client_handle);
++	ipa = container_of(ipa_qmi, struct ipa, qmi);
++
++	if (svc->instance == IPA_MODEM_SERVICE_INS_ID_ALT) {
++		ipa_qmi->modem_sq_alt.sq_family = AF_QIPCRTR;
++		ipa_qmi->modem_sq_alt.sq_node = svc->node;
++		ipa_qmi->modem_sq_alt.sq_port = svc->port;
++		ipa_qmi->modem_sq_alt_valid = true;
++		ipa_mhi_modem_server_alt(ipa, &ipa_qmi->modem_sq_alt);
++		dev_info(ipa->dev,
++			 "IPA modem alt service at %u:%u (instance %u)\n",
++			 svc->node, svc->port, svc->instance);
++		return 0;
++	}
+ 
+ 	ipa_qmi->modem_sq.sq_family = AF_QIPCRTR;
+ 	ipa_qmi->modem_sq.sq_node = svc->node;
+ 	ipa_qmi->modem_sq.sq_port = svc->port;
+ 
++	ipa_mhi_modem_server(ipa, &ipa_qmi->modem_sq);
++
++	/* On SDX55-fusion (qcom,sm8250-ipa) the modem ignores the legacy
++	 * INIT_DRIVER request and instead expects the AP-side IPA MHI proxy
++	 * MHI_READY indication carrying remote channel doorbell info.  Kick
++	 * the MHI proxy registration here; ipa_mhi_modem_ready returns
++	 * non-fusion as a no-op.
++	 */
++	if (of_device_is_compatible(ipa->dev->of_node, "qcom,sm8250-ipa")) {
++		int ret;
++
++		dev_info(ipa->dev,
++			 "IPA modem service at %u:%u; arming MHI proxy\n",
++			 svc->node, svc->port);
++		ret = ipa_mhi_modem_ready(ipa);
++		if (ret)
++			dev_err(ipa->dev,
++				"error %d arming IPA MHI proxy\n", ret);
++		return 0;
++	}
++
++	dev_info(ipa->dev, "IPA modem service at %u:%u; sending INIT_DRIVER\n",
++		 svc->node, svc->port);
+ 	schedule_work(&ipa_qmi->init_driver_work);
+ 
+ 	return 0;
+@@ -501,13 +615,30 @@
+ 	/* We need this ready before the service lookup is added */
+ 	INIT_WORK(&ipa_qmi->init_driver_work, ipa_client_init_driver_work);
+ 
++	ret = ipa_mhi_setup(ipa);
++	if (ret)
++		goto err_client_handle_release;
++
+ 	ret = qmi_add_lookup(&ipa_qmi->client_handle, IPA_MODEM_SERVICE_SVC_ID,
+ 			     IPA_MODEM_SVC_VERS, IPA_MODEM_SERVICE_INS_ID);
+ 	if (ret)
+-		goto err_client_handle_release;
++		goto err_mhi_teardown;
++
++	/*
++	 * Second lookup for the alt PD instance.  Best-effort: if the modem
++	 * never publishes it, ipa_qmi->modem_sq_alt_valid stays false and we
++	 * just don't deliver the alt INIT_COMPLETE.
++	 */
++	ret = qmi_add_lookup(&ipa_qmi->client_handle, IPA_MODEM_SERVICE_SVC_ID,
++			     IPA_MODEM_SVC_VERS,
++			     IPA_MODEM_SERVICE_INS_ID_ALT);
++	if (ret)
++		goto err_mhi_teardown;
+ 
+ 	return 0;
+ 
++err_mhi_teardown:
++	ipa_mhi_teardown(ipa);
+ err_client_handle_release:
+ 	/* Releasing the handle also removes registered lookups */
+ 	qmi_handle_release(&ipa_qmi->client_handle);
+@@ -525,6 +656,8 @@
+ {
+ 	cancel_work_sync(&ipa->qmi.init_driver_work);
+ 
++	ipa_mhi_teardown(ipa);
++
+ 	qmi_handle_release(&ipa->qmi.client_handle);
+ 	memset(&ipa->qmi.client_handle, 0, sizeof(ipa->qmi.client_handle));
+ 
+--- a/drivers/net/ipa/ipa_qmi.h
++++ b/drivers/net/ipa/ipa_qmi.h
+@@ -31,6 +31,8 @@
+ 
+ 	/* Information used for the client handle */
+ 	struct sockaddr_qrtr modem_sq;
++	struct sockaddr_qrtr modem_sq_alt;
++	bool modem_sq_alt_valid;
+ 	struct work_struct init_driver_work;
+ 
+ 	/* Flags used in negotiating readiness */
+--- a/drivers/net/ipa/ipa_qmi_msg.c
++++ b/drivers/net/ipa/ipa_qmi_msg.c
+@@ -722,3 +722,469 @@
+ 		.data_type	= QMI_EOTI,
+ 	},
+ };
++
++static const struct qmi_elem_info ipa_mhi_ch_init_info_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ch_init_info,
++					       ch_id),
++		.offset		= offsetof(struct ipa_mhi_ch_init_info, ch_id),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ch_init_info,
++					       er_id),
++		.offset		= offsetof(struct ipa_mhi_ch_init_info, er_id),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ch_init_info,
++					       ch_doorbell_addr),
++		.offset		= offsetof(struct ipa_mhi_ch_init_info,
++					   ch_doorbell_addr),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ch_init_info,
++					       er_doorbell_addr),
++		.offset		= offsetof(struct ipa_mhi_ch_init_info,
++					   er_doorbell_addr),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ch_init_info,
++					       direction_type),
++		.offset		= offsetof(struct ipa_mhi_ch_init_info,
++					   direction_type),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++static const struct qmi_elem_info ipa_mhi_smmu_info_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_smmu_info,
++					       iova_ctl_base_addr),
++		.offset		= offsetof(struct ipa_mhi_smmu_info,
++					   iova_ctl_base_addr),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_smmu_info,
++					       iova_ctl_size),
++		.offset		= offsetof(struct ipa_mhi_smmu_info,
++					   iova_ctl_size),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_smmu_info,
++					       iova_data_base_addr),
++		.offset		= offsetof(struct ipa_mhi_smmu_info,
++					   iova_data_base_addr),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_smmu_info,
++					       iova_data_size),
++		.offset		= offsetof(struct ipa_mhi_smmu_info,
++					   iova_data_size),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++const struct qmi_elem_info ipa_mhi_ready_ind_ei[] = {
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ipa_mhi_ready_ind,
++					   ch_info_arr_len),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= IPA_QMI_REMOTE_MHI_CHANNELS_MAX,
++		.elem_size	= sizeof_field(struct ipa_mhi_ready_ind,
++					       ch_info_arr[0]),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ipa_mhi_ready_ind,
++					   ch_info_arr),
++		.ei_array	= ipa_mhi_ch_init_info_ei,
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ready_ind,
++					       smmu_info_valid),
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ipa_mhi_ready_ind,
++					   smmu_info_valid),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ready_ind,
++					       smmu_info),
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ipa_mhi_ready_ind, smmu_info),
++		.ei_array	= ipa_mhi_smmu_info_ei,
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++static const struct qmi_elem_info ipa_mhi_mem_addr_info_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_mem_addr_info, pa),
++		.offset		= offsetof(struct ipa_mhi_mem_addr_info, pa),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_mem_addr_info, iova),
++		.offset		= offsetof(struct ipa_mhi_mem_addr_info, iova),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_mem_addr_info, size),
++		.offset		= offsetof(struct ipa_mhi_mem_addr_info, size),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++static const struct qmi_elem_info ipa_mhi_tr_info_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_tr_info, ch_id),
++		.offset		= offsetof(struct ipa_mhi_tr_info, ch_id),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_2_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_tr_info, poll_cfg),
++		.offset		= offsetof(struct ipa_mhi_tr_info, poll_cfg),
++	},
++	{
++		.data_type	= QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_tr_info,
++					       brst_mode_type),
++		.offset		= offsetof(struct ipa_mhi_tr_info,
++					   brst_mode_type),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_tr_info, ring_iova),
++		.offset		= offsetof(struct ipa_mhi_tr_info, ring_iova),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_tr_info, ring_len),
++		.offset		= offsetof(struct ipa_mhi_tr_info, ring_len),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_tr_info, rp),
++		.offset		= offsetof(struct ipa_mhi_tr_info, rp),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_tr_info, wp),
++		.offset		= offsetof(struct ipa_mhi_tr_info, wp),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++static const struct qmi_elem_info ipa_mhi_er_info_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info, er_id),
++		.offset		= offsetof(struct ipa_mhi_er_info, er_id),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info,
++					       intmod_cycles),
++		.offset		= offsetof(struct ipa_mhi_er_info, intmod_cycles),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info,
++					       intmod_count),
++		.offset		= offsetof(struct ipa_mhi_er_info, intmod_count),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info, msi_addr),
++		.offset		= offsetof(struct ipa_mhi_er_info, msi_addr),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info, ring_iova),
++		.offset		= offsetof(struct ipa_mhi_er_info, ring_iova),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info, ring_len),
++		.offset		= offsetof(struct ipa_mhi_er_info, ring_len),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info, rp),
++		.offset		= offsetof(struct ipa_mhi_er_info, rp),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_er_info, wp),
++		.offset		= offsetof(struct ipa_mhi_er_info, wp),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++const struct qmi_elem_info ipa_mhi_alloc_channel_req_ei[] = {
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   tr_info_arr_len),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= IPA_QMI_REMOTE_MHI_CHANNELS_MAX,
++		.elem_size	= sizeof_field(struct ipa_mhi_alloc_channel_req,
++					       tr_info_arr[0]),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   tr_info_arr),
++		.ei_array	= ipa_mhi_tr_info_ei,
++	},
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   er_info_arr_len),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= IPA_QMI_REMOTE_MHI_CHANNELS_MAX,
++		.elem_size	= sizeof_field(struct ipa_mhi_alloc_channel_req,
++					       er_info_arr[0]),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   er_info_arr),
++		.ei_array	= ipa_mhi_er_info_ei,
++	},
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.tlv_type	= 0x03,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   ctrl_addr_map_info_len),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX,
++		.elem_size	= sizeof_field(struct ipa_mhi_alloc_channel_req,
++					       ctrl_addr_map_info[0]),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x03,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   ctrl_addr_map_info),
++		.ei_array	= ipa_mhi_mem_addr_info_ei,
++	},
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.tlv_type	= 0x04,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   data_addr_map_info_len),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX,
++		.elem_size	= sizeof_field(struct ipa_mhi_alloc_channel_req,
++					       data_addr_map_info[0]),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x04,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_req,
++					   data_addr_map_info),
++		.ei_array	= ipa_mhi_mem_addr_info_ei,
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++static const struct qmi_elem_info ipa_mhi_ch_alloc_resp_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ch_alloc_resp,
++					       ch_id),
++		.offset		= offsetof(struct ipa_mhi_ch_alloc_resp, ch_id),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_ch_alloc_resp,
++					       is_success),
++		.offset		= offsetof(struct ipa_mhi_ch_alloc_resp,
++					   is_success),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++const struct qmi_elem_info ipa_mhi_alloc_channel_rsp_ei[] = {
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_alloc_channel_rsp,
++					       rsp),
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_rsp, rsp),
++		.ei_array	= qmi_response_type_v01_ei,
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_alloc_channel_rsp,
++					       alloc_resp_arr_valid),
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_rsp,
++					   alloc_resp_arr_valid),
++	},
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_rsp,
++					   alloc_resp_arr_len),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= IPA_QMI_REMOTE_MHI_CHANNELS_MAX,
++		.elem_size	= sizeof_field(struct ipa_mhi_alloc_channel_rsp,
++					       alloc_resp_arr[0]),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ipa_mhi_alloc_channel_rsp,
++					   alloc_resp_arr),
++		.ei_array	= ipa_mhi_ch_alloc_resp_ei,
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++const struct qmi_elem_info ipa_mhi_clk_vote_req_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_clk_vote_req,
++					       mhi_vote),
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ipa_mhi_clk_vote_req,
++					   mhi_vote),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_clk_vote_req,
++					       tput_value_valid),
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ipa_mhi_clk_vote_req,
++					   tput_value_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_clk_vote_req,
++					       tput_value),
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ipa_mhi_clk_vote_req,
++					   tput_value),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_clk_vote_req,
++					       clk_rate_valid),
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct ipa_mhi_clk_vote_req,
++					   clk_rate_valid),
++	},
++	{
++		.data_type	= QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_clk_vote_req,
++					       clk_rate),
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct ipa_mhi_clk_vote_req,
++					   clk_rate),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++const struct qmi_elem_info ipa_mhi_clk_vote_rsp_ei[] = {
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	= sizeof_field(struct ipa_mhi_clk_vote_rsp, rsp),
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct ipa_mhi_clk_vote_rsp, rsp),
++		.ei_array	= qmi_response_type_v01_ei,
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
+--- a/drivers/net/ipa/ipa_qmi_msg.h
++++ b/drivers/net/ipa/ipa_qmi_msg.h
+@@ -19,6 +19,9 @@
+ #define IPA_QMI_INIT_DRIVER		0x21	/* AP -> modem request */
+ #define IPA_QMI_INIT_COMPLETE		0x22	/* AP -> modem indication */
+ #define IPA_QMI_DRIVER_INIT_COMPLETE	0x35	/* modem -> AP request */
++#define IPA_QMI_MHI_CLK_VOTE		0x3b	/* modem -> AP request */
++#define IPA_QMI_MHI_READY		0x3c	/* AP -> modem indication */
++#define IPA_QMI_MHI_ALLOC_CHANNEL	0x3d	/* modem -> AP request */
+ 
+ /* The maximum size required for message types.  These sizes include
+  * the message data, along with type (1 byte) and length (2 byte)
+@@ -32,10 +35,18 @@
+ #define IPA_QMI_INIT_COMPLETE_IND_SZ		7	/* <- server handle */
+ #define IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ	4	/* -> server handle */
+ #define IPA_QMI_DRIVER_INIT_COMPLETE_RSP_SZ	7	/* <- server handle */
++#define IPA_QMI_MHI_CLK_VOTE_REQ_SZ		18	/* -> server handle */
++#define IPA_QMI_MHI_CLK_VOTE_RSP_SZ		7	/* <- server handle */
++#define IPA_QMI_MHI_READY_IND_SZ		123	/* <- server handle */
++#define IPA_QMI_MHI_ALLOC_CHANNEL_REQ_SZ	808	/* -> server handle */
++#define IPA_QMI_MHI_ALLOC_CHANNEL_RSP_SZ	23	/* <- server handle */
+ 
+ /* Maximum size of messages we expect the AP to receive (max of above) */
+-#define IPA_QMI_SERVER_MAX_RCV_SZ		8
++#define IPA_QMI_SERVER_MAX_RCV_SZ		808
+ #define IPA_QMI_CLIENT_MAX_RCV_SZ		25
++
++#define IPA_QMI_REMOTE_MHI_CHANNELS_MAX		2
++#define IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX		2
+ 
+ /* Request message for the IPA_QMI_INDICATION_REGISTER request */
+ struct ipa_indication_register_req {
+@@ -247,6 +258,99 @@
+ 	u8				modem_driver_init_pending;
+ };
+ 
++struct ipa_mhi_ch_init_info {
++	u8 ch_id;
++	u8 er_id;
++	u32 ch_doorbell_addr;
++	u32 er_doorbell_addr;
++	u32 direction_type;
++};
++
++struct ipa_mhi_smmu_info {
++	u64 iova_ctl_base_addr;
++	u64 iova_ctl_size;
++	u64 iova_data_base_addr;
++	u64 iova_data_size;
++};
++
++struct ipa_mhi_ready_ind {
++	u32 ch_info_arr_len;
++	struct ipa_mhi_ch_init_info ch_info_arr[IPA_QMI_REMOTE_MHI_CHANNELS_MAX];
++	u8 smmu_info_valid;
++	struct ipa_mhi_smmu_info smmu_info;
++};
++
++enum ipa_mhi_brst_mode {
++	IPA_MHI_BRST_MODE_DEFAULT = 0,
++	IPA_MHI_BRST_MODE_ENABLED = 1,
++	IPA_MHI_BRST_MODE_DISABLED = 2,
++};
++
++struct ipa_mhi_tr_info {
++	u8 ch_id;
++	u16 poll_cfg;
++	u32 brst_mode_type;
++	u64 ring_iova;
++	u64 ring_len;
++	u64 rp;
++	u64 wp;
++};
++
++struct ipa_mhi_er_info {
++	u8 er_id;
++	u32 intmod_cycles;
++	u32 intmod_count;
++	u32 msi_addr;
++	u64 ring_iova;
++	u64 ring_len;
++	u64 rp;
++	u64 wp;
++};
++
++struct ipa_mhi_mem_addr_info {
++	u64 pa;
++	u64 iova;
++	u64 size;
++};
++
++struct ipa_mhi_alloc_channel_req {
++	u32 tr_info_arr_len;
++	struct ipa_mhi_tr_info tr_info_arr[IPA_QMI_REMOTE_MHI_CHANNELS_MAX];
++	u32 er_info_arr_len;
++	struct ipa_mhi_er_info er_info_arr[IPA_QMI_REMOTE_MHI_CHANNELS_MAX];
++	u32 ctrl_addr_map_info_len;
++	struct ipa_mhi_mem_addr_info
++		ctrl_addr_map_info[IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX];
++	u32 data_addr_map_info_len;
++	struct ipa_mhi_mem_addr_info
++		data_addr_map_info[IPA_QMI_REMOTE_MHI_MEM_MAPS_MAX];
++};
++
++struct ipa_mhi_ch_alloc_resp {
++	u8 ch_id;
++	u8 is_success;
++};
++
++struct ipa_mhi_alloc_channel_rsp {
++	struct qmi_response_type_v01 rsp;
++	u8 alloc_resp_arr_valid;
++	u32 alloc_resp_arr_len;
++	struct ipa_mhi_ch_alloc_resp
++		alloc_resp_arr[IPA_QMI_REMOTE_MHI_CHANNELS_MAX];
++};
++
++struct ipa_mhi_clk_vote_req {
++	u8 mhi_vote;
++	u8 tput_value_valid;
++	u32 tput_value;
++	u8 clk_rate_valid;
++	u32 clk_rate;
++};
++
++struct ipa_mhi_clk_vote_rsp {
++	struct qmi_response_type_v01 rsp;
++};
++
+ /* Message structure definitions defined in "ipa_qmi_msg.c" */
+ extern const struct qmi_elem_info ipa_indication_register_req_ei[];
+ extern const struct qmi_elem_info ipa_indication_register_rsp_ei[];
+@@ -258,5 +362,10 @@
+ extern const struct qmi_elem_info ipa_mem_range_ei[];
+ extern const struct qmi_elem_info ipa_init_modem_driver_req_ei[];
+ extern const struct qmi_elem_info ipa_init_modem_driver_rsp_ei[];
++extern const struct qmi_elem_info ipa_mhi_ready_ind_ei[];
++extern const struct qmi_elem_info ipa_mhi_alloc_channel_req_ei[];
++extern const struct qmi_elem_info ipa_mhi_alloc_channel_rsp_ei[];
++extern const struct qmi_elem_info ipa_mhi_clk_vote_req_ei[];
++extern const struct qmi_elem_info ipa_mhi_clk_vote_rsp_ei[];
+ 
+ #endif /* !_IPA_QMI_MSG_H_ */
+--- a/drivers/net/ipa/ipa_smp2p.c
++++ b/drivers/net/ipa/ipa_smp2p.c
+@@ -7,6 +7,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/notifier.h>
+ #include <linux/panic_notifier.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/types.h>
+@@ -228,6 +229,11 @@
+ 	u32 valid_bit;
+ 	int ret;
+ 
++	if (!of_find_property(dev->of_node, "qcom,smem-state-names", NULL)) {
++		dev_info(dev, "IPA SMP2P states not defined; skipping modem power-query handshake\n");
++		return 0;
++	}
++
+ 	valid_state = qcom_smem_state_get(dev, "ipa-clock-enabled-valid",
+ 					  &valid_bit);
+ 	if (IS_ERR(valid_state))
+@@ -309,6 +315,9 @@
+ {
+ 	struct ipa_smp2p *smp2p = ipa->smp2p;
+ 
++	if (!smp2p)
++		return;
++
+ 	if (smp2p->setup_ready_irq)
+ 		ipa_smp2p_irq_exit(smp2p, smp2p->setup_ready_irq);
+ 	ipa_smp2p_panic_notifier_unregister(smp2p);
+@@ -326,6 +335,9 @@
+ {
+ 	struct ipa_smp2p *smp2p = ipa->smp2p;
+ 
++	if (!smp2p)
++		return;
++
+ 	if (!smp2p->setup_ready_irq)
+ 		return;
+ 
+@@ -345,6 +357,9 @@
+ 	struct ipa_smp2p *smp2p = ipa->smp2p;
+ 	u32 mask;
+ 
++	if (!smp2p)
++		return;
++
+ 	if (!smp2p->notified)
+ 		return;
+ 
+--- a/drivers/net/ipa/ipa_uc.c
++++ b/drivers/net/ipa/ipa_uc.c
+@@ -5,12 +5,16 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/errno.h>
++#include <linux/gfp.h>
+ #include <linux/io.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/types.h>
+ 
+ #include "ipa.h"
+ #include "ipa_interrupt.h"
++#include "ipa_mhi.h"
+ #include "ipa_power.h"
+ #include "ipa_reg.h"
+ #include "ipa_uc.h"
+@@ -100,6 +104,7 @@
+ 	IPA_UC_COMMAND_RESET_PIPE	= 0x8,
+ 	IPA_UC_COMMAND_REG_WRITE	= 0x9,
+ 	IPA_UC_COMMAND_GSI_CH_EMPTY	= 0xa,
++	IPA_UC_COMMAND_REMOTE_IPA_INFO	= 0xb,
+ };
+ 
+ /** enum ipa_uc_response - microcontroller response codes */
+@@ -115,6 +120,11 @@
+ 	IPA_UC_EVENT_NO_OP		= 0x0,
+ 	IPA_UC_EVENT_ERROR		= 0x1,
+ 	IPA_UC_EVENT_LOG_INFO		= 0x2,
++};
++
++struct ipa_uc_mhi_db_addr_info {
++	__le32 remote_addr;
++	__le32 mailbox;
+ };
+ 
+ static struct ipa_uc_mem_area *ipa_uc_shared(struct ipa *ipa)
+@@ -155,14 +165,25 @@
+ 	 */
+ 	switch (shared->response) {
+ 	case IPA_UC_RESPONSE_INIT_COMPLETED:
++		if (ipa->uc_loaded) {
++			dev_warn(dev, "unexpected init_completed response\n");
++		} else {
++			ipa->uc_loaded = true;
++			dev_info(dev, "IPA uC loaded\n");
++			/* uc_loaded is a precondition for IPA MHI proxy
++			 * MHI_READY indication.  Retry now in case the
++			 * modem advertised its IPA service before uC was up.
++			 */
++			ipa_mhi_send_ready(ipa);
++		}
++
+ 		if (ipa->uc_powered) {
+-			ipa->uc_loaded = true;
+ 			ipa_power_retention(ipa, true);
+ 			(void)pm_runtime_put_autosuspend(dev);
+ 			ipa->uc_powered = false;
+-		} else {
+-			dev_warn(dev, "unexpected init_completed response\n");
+ 		}
++		break;
++	case IPA_UC_RESPONSE_CMD_COMPLETED:
+ 		break;
+ 	default:
+ 		dev_warn(dev, "unsupported microcontroller response %u\n",
+@@ -247,6 +268,58 @@
+ 	iowrite32(val, ipa->reg_virt + reg_offset(reg));
+ }
+ 
++static int ipa_uc_command_wait(struct ipa *ipa, u32 command, dma_addr_t param)
++{
++	struct ipa_uc_mem_area *shared = ipa_uc_shared(ipa);
++	const struct reg *reg;
++	u32 val;
++	u32 i;
++
++	shared->command = command;
++	shared->command_param = cpu_to_le32(lower_32_bits(param));
++	shared->command_param_hi = cpu_to_le32(upper_32_bits(param));
++	shared->response = 0;
++	shared->response_param = 0;
++
++	reg = ipa_reg(ipa, IPA_IRQ_UC);
++	val = reg_bit(reg, UC_INTR);
++
++	wmb();
++	iowrite32(val, ipa->reg_virt + reg_offset(reg));
++
++	for (i = 0; i < 1000; i++) {
++		if (shared->response == IPA_UC_RESPONSE_CMD_COMPLETED)
++			return 0;
++		if (shared->response != IPA_UC_RESPONSE_NO_OP)
++			return -EIO;
++		usleep_range(1000, 2000);
++	}
++
++	return -ETIMEDOUT;
++}
++
++int ipa_uc_mhi_remote_info(struct ipa *ipa, u32 remote_addr, u32 mailbox)
++{
++	struct ipa_uc_mhi_db_addr_info *info;
++	dma_addr_t dma;
++	int ret;
++
++	if (!ipa->uc_loaded)
++		return -ENODEV;
++
++	info = dma_alloc_coherent(ipa->dev, sizeof(*info), &dma, GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++
++	info->remote_addr = cpu_to_le32(remote_addr);
++	info->mailbox = cpu_to_le32(mailbox);
++
++	ret = ipa_uc_command_wait(ipa, IPA_UC_COMMAND_REMOTE_IPA_INFO, dma);
++	dma_free_coherent(ipa->dev, sizeof(*info), info, dma);
++
++	return ret;
++}
++
+ /* Tell the microcontroller the AP is shutting down */
+ void ipa_uc_panic_notifier(struct ipa *ipa)
+ {
+--- a/drivers/net/ipa/ipa_uc.h
++++ b/drivers/net/ipa/ipa_uc.h
+@@ -42,6 +42,16 @@
+ void ipa_uc_power(struct ipa *ipa);
+ 
+ /**
++ * ipa_uc_mhi_remote_info() - map an MHI doorbell into an IPA uC mailbox
++ * @ipa:		IPA pointer
++ * @remote_addr:	MHI channel/event doorbell physical address
++ * @mailbox:		IPA uC mailbox number
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int ipa_uc_mhi_remote_info(struct ipa *ipa, u32 remote_addr, u32 mailbox);
++
++/**
+  * ipa_uc_panic_notifier()
+  * @ipa:	IPA pointer
+  *

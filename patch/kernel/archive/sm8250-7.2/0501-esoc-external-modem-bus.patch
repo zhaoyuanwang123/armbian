@@ -1,0 +1,5316 @@
+From: Zhao_Wang <umi@xiaomi>
+Subject: [PATCH] ESOC: external modem subsystem bus and drivers (qcom,ext-sdx55m) + legacy gpio/ipc-logging helpers
+
+Xiaomi Mi 10 (umi): ESOC: external modem subsystem bus and drivers (qcom,ext-sdx55m) + legacy gpio/ipc-logging helpers — ported from the Mi 10T pmOS
+kernel set onto 7.2.11; naming unified to umi. Part of the
+SDX55m external modem (mobile data) bring-up.
+
+Signed-off-by: Zhao_Wang <umi@xiaomi>
+---
+--- a/drivers/gpio/gpiolib-of.c
++++ b/drivers/gpio/gpiolib-of.c
+@@ -15,6 +15,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
++#include <linux/of_gpio.h>
+ #include <linux/pinctrl/pinctrl.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -24,21 +25,6 @@
+ 
+ #include "gpiolib.h"
+ #include "gpiolib-of.h"
+-
+-/*
+- * This is Linux-specific flags. By default controllers' and Linux' mapping
+- * match, but GPIO controllers are free to translate their own flags to
+- * Linux-specific in their .xlate callback. Though, 1:1 mapping is recommended.
+- */
+-enum of_gpio_flags {
+-	OF_GPIO_ACTIVE_LOW = 0x1,
+-	OF_GPIO_SINGLE_ENDED = 0x2,
+-	OF_GPIO_OPEN_DRAIN = 0x4,
+-	OF_GPIO_TRANSITORY = 0x8,
+-	OF_GPIO_PULL_UP = 0x10,
+-	OF_GPIO_PULL_DOWN = 0x20,
+-	OF_GPIO_PULL_DISABLE = 0x40,
+-};
+ 
+ /**
+  * of_gpio_named_count() - Count GPIOs for a device
+@@ -454,6 +440,34 @@
+ 	return desc;
+ }
+ 
++/**
++ * of_get_named_gpio_flags() - Get a GPIO number and its OF flags
++ * @np:		device node to get GPIO from
++ * @list_name:	Name of property containing gpio specifier(s)
++ * @index:	index of the GPIO
++ * @flags:	optional storage for the OF GPIO flags
++ *
++ * **DEPRECATED** Only kept for out-of-tree drivers still using the legacy
++ * integer GPIO API; new code must use the descriptor API instead.
++ *
++ * Returns:
++ * GPIO number to use with Linux generic GPIO API, or one of the errno
++ * value on the error condition.
++ */
++int of_get_named_gpio_flags(const struct device_node *np, const char *list_name,
++			    int index, enum of_gpio_flags *flags)
++{
++	struct gpio_desc *desc;
++
++	desc = of_get_named_gpiod_flags(np, list_name, index, flags);
++
++	if (IS_ERR(desc))
++		return PTR_ERR(desc);
++	else
++		return desc_to_gpio(desc);
++}
++EXPORT_SYMBOL_GPL(of_get_named_gpio_flags);
++
+ /* Converts gpio_lookup_flags into bitmask of GPIO_* values */
+ static unsigned long of_convert_gpio_flags(enum of_gpio_flags flags)
+ {
+--- a/drivers/remoteproc/Kconfig
++++ b/drivers/remoteproc/Kconfig
+@@ -236,6 +236,72 @@
+ 	  subsystems such as ADSP (Audio DSP), CDSP (Compute DSP), MPSS (Modem
+ 	  Peripheral SubSystem), and SLPI (Sensor Low Power Island).
+ 
++config QCOM_ESOC
++	tristate "External SOCs Control"
++	help
++	  External SOCs can be powered on and monitored by user
++	  space or kernel drivers. Additionally they can be controlled
++	  to respond to control commands. This framework provides an
++	  interface to track events related to the external slave socs.
++
++config QCOM_ESOC_DEV
++	tristate "ESOC userspace interface"
++	help
++	  Say yes here to enable a userspace representation of the control
++	  link. Userspace can register a request engine or a command engine
++	  for the external soc. It can receive event notifications from the
++	  control link.
++
++config QCOM_ESOC_CLIENT
++	tristate "ESOC client interface"
++	depends on OF
++	help
++	  Say yes here to enable client interface for external socs.
++	  Clients can specify the external soc that they are interested in
++	  by using device tree phandles. Based on this, clients can register
++	  for notifications from a specific soc.
++
++config QCOM_ESOC_DEBUG
++	tristate "ESOC debug support"
++	help
++	  Say yes here to enable debugging support in the ESOC framework
++	  and individual esoc drivers. The config basically adds extra
++	  logging information such that, in the event of a bug, this
++	  logging information could be helpful to trace it.
++
++config QCOM_ESOC_MDM_4X
++	tristate "Add support for external modems"
++	help
++	  In some Qualcomm Technologies, Inc. boards, an external modem such
++	  as mdm9x55 or sdx50m is connected to a primary msm. The primary soc
++	  can control/monitor the modem via gpios. The data communication
++	  with such modems can occur over PCIE or HSIC.
++
++config QCOM_ESOC_MDM_DRV
++	tristate "Command engine for 4x series external modems"
++	help
++	  Provides a command engine to control the behavior of an external
++	  modems (such as mdm9x55 or sdx50m). That is, it extends the SSR
++	  framework to power-off, power-on or handle crash scenarios. It
++	  also listens for events on the external modem.
++
++config QCOM_ESOC_DBG_ENG
++	tristate "debug engine for 4x series external modems"
++	depends on QCOM_ESOC_MDM_DRV
++	help
++	  Mainly used as a debug interface to probe the modem against various
++	  scenarios. It basically provides a user interface to mask out certain
++	  commands sent by command engine to the external modem. It also allows
++	  masking of certain notifications being sent to the external modem.
++
++config QCOM_ESOC_DBG_REQ_ENG
++	bool "manual request engine for 4x series external modems"
++	depends on QCOM_ESOC_DBG_ENG
++	help
++	  Provides a user interface to handle incoming requests from
++	  the external modem. Allows for debugging of IPC mechanism
++	  between the external modem and the primary soc.
++
+ config QCOM_Q6V5_WCSS
+ 	tristate "Qualcomm Hexagon based WCSS Peripheral Image Loader"
+ 	depends on OF && ARCH_QCOM
+--- a/drivers/remoteproc/Makefile
++++ b/drivers/remoteproc/Makefile
+@@ -28,6 +28,14 @@
+ obj-$(CONFIG_QCOM_Q6V5_MSS)		+= qcom_q6v5_mss.o
+ obj-$(CONFIG_QCOM_Q6V5_PAS)		+= qcom_q6v5_pas.o
+ obj-$(CONFIG_QCOM_Q6V5_WCSS)		+= qcom_q6v5_wcss.o
++obj-$(CONFIG_QCOM_ESOC)			+= qcom_esoc.o
++qcom_esoc-y				+= esoc_bus.o
++obj-$(CONFIG_QCOM_ESOC_DEV)		+= esoc_dev.o
++obj-$(CONFIG_QCOM_ESOC_CLIENT)		+= esoc_client.o
++obj-$(CONFIG_QCOM_ESOC_MDM_4X)		+= esoc-mdm-pon.o esoc-mdm-4x.o
++obj-$(CONFIG_QCOM_ESOC_MDM_DRV)		+= esoc-mdm-drv.o
++obj-$(CONFIG_QCOM_ESOC_DBG_ENG)		+= esoc-mdm-dbg-eng.o
++ccflags-$(CONFIG_ESOC_DEBUG)		:= -DDEBUG
+ obj-$(CONFIG_QCOM_SYSMON)		+= qcom_sysmon.o
+ obj-$(CONFIG_QCOM_WCNSS_PIL)		+= qcom_wcnss_pil.o
+ qcom_wcnss_pil-y			+= qcom_wcnss.o
+--- /dev/null
++++ b/drivers/remoteproc/esoc-mdm-4x.c
+@@ -0,0 +1,1408 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2014-2015, 2017-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/coresight.h>
++#include <linux/workqueue.h>
++#include <linux/sched/clock.h>
++#include <linux/regulator/consumer.h>
++#include "esoc-mdm.h"
++
++enum gpio_update_config {
++	GPIO_UPDATE_BOOTING_CONFIG = 1,
++	GPIO_UPDATE_RUNNING_CONFIG,
++};
++
++enum irq_mask {
++	IRQ_ERRFATAL = 0x1,
++	IRQ_STATUS = 0x2,
++	IRQ_PBLRDY = 0x4,
++};
++
++
++static struct gpio_map {
++	const char *name;
++	int index;
++} gpio_map[] = {
++	{"qcom,mdm2ap-errfatal-gpio",    MDM2AP_ERRFATAL},
++	{"qcom,ap2mdm-errfatal-gpio",    AP2MDM_ERRFATAL},
++	{"qcom,mdm2ap-status-gpio",      MDM2AP_STATUS},
++	{"qcom,ap2mdm-status-gpio",      AP2MDM_STATUS},
++	{"qcom,mdm2ap-pblrdy-gpio",      MDM2AP_PBLRDY},
++	{"qcom,ap2mdm-wakeup-gpio",      AP2MDM_WAKEUP},
++	{"qcom,ap2mdm-chnlrdy-gpio",     AP2MDM_CHNLRDY},
++	{"qcom,mdm2ap-wakeup-gpio",      MDM2AP_WAKEUP},
++	{"qcom,ap2mdm-vddmin-gpio",      AP2MDM_VDDMIN},
++	{"qcom,mdm2ap-vddmin-gpio",      MDM2AP_VDDMIN},
++	{"qcom,ap2mdm-pmic-pwr-en-gpio", AP2MDM_PMIC_PWR_EN},
++	{"qcom,mdm-link-detect-gpio",	 MDM_LINK_DETECT},
++};
++
++/* Required gpios */
++static const int required_gpios[] = {
++	MDM2AP_ERRFATAL,
++	AP2MDM_ERRFATAL,
++	MDM2AP_STATUS,
++	AP2MDM_STATUS,
++};
++
++void *ipc_log;
++
++static void mdm_debug_gpio_show(struct mdm_ctrl *mdm)
++{
++	struct device *dev = mdm->dev;
++
++	dev_dbg(dev, "%s: MDM2AP_ERRFATAL gpio = %d\n", __func__, MDM_GPIO(mdm, MDM2AP_ERRFATAL));
++	dev_dbg(dev, "%s: AP2MDM_ERRFATAL gpio = %d\n", __func__, MDM_GPIO(mdm, AP2MDM_ERRFATAL));
++	dev_dbg(dev, "%s: MDM2AP_STATUS gpio = %d\n", __func__, MDM_GPIO(mdm, MDM2AP_STATUS));
++	dev_dbg(dev, "%s: AP2MDM_STATUS gpio = %d\n", __func__, MDM_GPIO(mdm, AP2MDM_STATUS));
++	dev_dbg(dev, "%s: AP2MDM_SOFT_RESET gpio = %d\n",
++		__func__, MDM_GPIO(mdm, AP2MDM_SOFT_RESET));
++	dev_dbg(dev, "%s: MDM2AP_WAKEUP gpio = %d\n", __func__, MDM_GPIO(mdm, MDM2AP_WAKEUP));
++	dev_dbg(dev, "%s: AP2MDM_WAKEUP gpio = %d\n", __func__, MDM_GPIO(mdm, AP2MDM_WAKEUP));
++	dev_dbg(dev, "%s: AP2MDM_PMIC_PWR_EN gpio = %d\n",
++		__func__, MDM_GPIO(mdm, AP2MDM_PMIC_PWR_EN));
++	dev_dbg(dev, "%s: MDM2AP_PBLRDY gpio = %d\n", __func__, MDM_GPIO(mdm, MDM2AP_PBLRDY));
++	dev_dbg(dev, "%s: AP2MDM_VDDMIN gpio = %d\n", __func__, MDM_GPIO(mdm, AP2MDM_VDDMIN));
++	dev_dbg(dev, "%s: MDM2AP_VDDMIN gpio = %d\n", __func__, MDM_GPIO(mdm, MDM2AP_VDDMIN));
++}
++
++static void mdm_debug_gpio_ipc_log(struct mdm_ctrl *mdm)
++{
++	esoc_mdm_log("MDM2AP_ERRFATAL gpio = %d\n", MDM_GPIO(mdm, MDM2AP_ERRFATAL));
++	esoc_mdm_log("AP2MDM_ERRFATAL gpio = %d\n", MDM_GPIO(mdm, AP2MDM_ERRFATAL));
++	esoc_mdm_log("MDM2AP_STATUS gpio = %d\n", MDM_GPIO(mdm, MDM2AP_STATUS));
++	esoc_mdm_log("AP2MDM_STATUS gpio = %d\n", MDM_GPIO(mdm, AP2MDM_STATUS));
++	esoc_mdm_log("AP2MDM_SOFT_RESET gpio = %d\n", MDM_GPIO(mdm, AP2MDM_SOFT_RESET));
++}
++
++static void mdm_trace_state(struct mdm_ctrl *mdm, const char *tag)
++{
++	pr_info("esoc-mdm: %s ap2mdm_status=%d ap2mdm_errfatal=%d mdm2ap_status=%d mdm2ap_errfatal=%d ready=%d init=%d\n",
++		tag,
++		gpio_get_value(MDM_GPIO(mdm, AP2MDM_STATUS)),
++		gpio_get_value(MDM_GPIO(mdm, AP2MDM_ERRFATAL)),
++		gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS)),
++		gpio_get_value(MDM_GPIO(mdm, MDM2AP_ERRFATAL)),
++		mdm->ready, mdm->init);
++}
++
++static void mdm_enable_irqs(struct mdm_ctrl *mdm)
++{
++	if (!mdm)
++		return;
++	esoc_mdm_log("Enabling the interrupts\n");
++	if (mdm->irq_mask & IRQ_ERRFATAL) {
++		enable_irq(mdm->errfatal_irq);
++		mdm->irq_mask &= ~IRQ_ERRFATAL;
++	}
++	if (mdm->irq_mask & IRQ_STATUS) {
++		enable_irq(mdm->status_irq);
++		mdm->irq_mask &= ~IRQ_STATUS;
++	}
++	if (mdm->irq_mask & IRQ_PBLRDY) {
++		enable_irq(mdm->pblrdy_irq);
++		mdm->irq_mask &= ~IRQ_PBLRDY;
++	}
++}
++
++void mdm_disable_irqs(struct mdm_ctrl *mdm)
++{
++	if (!mdm)
++		return;
++	esoc_mdm_log("Disabling the interrupts\n");
++	if (!(mdm->irq_mask & IRQ_ERRFATAL)) {
++		disable_irq_nosync(mdm->errfatal_irq);
++		mdm->irq_mask |= IRQ_ERRFATAL;
++	}
++	if (!(mdm->irq_mask & IRQ_STATUS)) {
++		disable_irq_nosync(mdm->status_irq);
++		mdm->irq_mask |= IRQ_STATUS;
++	}
++	if (!(mdm->irq_mask & IRQ_PBLRDY)) {
++		disable_irq_nosync(mdm->pblrdy_irq);
++		mdm->irq_mask |= IRQ_PBLRDY;
++	}
++}
++
++static void mdm_deconfigure_ipc(struct mdm_ctrl *mdm)
++{
++	int i;
++
++	for (i = 0; i < NUM_GPIOS; ++i) {
++		if (gpio_is_valid(MDM_GPIO(mdm, i)))
++			gpio_free(MDM_GPIO(mdm, i));
++	}
++	if (mdm->mdm_queue) {
++		destroy_workqueue(mdm->mdm_queue);
++		mdm->mdm_queue = NULL;
++	}
++}
++
++static void mdm_update_gpio_configs(struct mdm_ctrl *mdm, enum gpio_update_config gpio_config)
++{
++	struct pinctrl_state *pins_state = NULL;
++	/* Some gpio configuration may need updating after modem bootup.*/
++	switch (gpio_config) {
++	case GPIO_UPDATE_RUNNING_CONFIG:
++		pins_state = mdm->gpio_state_running;
++		break;
++	case GPIO_UPDATE_BOOTING_CONFIG:
++		pins_state = mdm->gpio_state_booting;
++		break;
++	default:
++		pins_state = NULL;
++		dev_err(mdm->dev, "%s: called with no config\n", __func__);
++		break;
++	}
++	if (pins_state != NULL) {
++		if (pinctrl_select_state(mdm->pinctrl, pins_state))
++			dev_err(mdm->dev, "switching gpio config failed\n");
++	}
++}
++
++static int mdm_cmd_exe(enum esoc_cmd cmd, struct esoc_clink *esoc)
++{
++	struct mdm_ctrl *mdm = get_esoc_clink_data(esoc);
++	bool graceful_shutdown = false;
++	u32 status, err_fatal;
++
++	switch (cmd) {
++	case ESOC_PWR_ON:
++		mdm_trace_state(mdm, "before ESOC_PWR_ON");
++		if (esoc->auto_boot) {
++			/*
++			 * If esoc has already booted, we would have missed
++			 * status change interrupt. Read status and err_fatal
++			 * signals to arrive at the state of esoc.
++			 */
++			esoc->clink_ops->get_status(&status, esoc);
++			esoc->clink_ops->get_err_fatal(&err_fatal, esoc);
++			if (err_fatal)
++				return -EIO;
++			if (status && !mdm->ready) {
++				mdm->ready = true;
++				esoc->clink_ops->notify(ESOC_BOOT_DONE, esoc);
++			}
++		}
++		esoc_mdm_log("ESOC_PWR_ON: Setting AP2MDM_ERRFATAL = 0\n");
++		gpio_set_value(MDM_GPIO(mdm, AP2MDM_ERRFATAL), 0);
++		mdm->init = 1;
++		mdm_do_first_power_on(mdm);
++		mdm_enable_irqs(mdm);
++		mdm_trace_state(mdm, "after ESOC_PWR_ON");
++		break;
++	case ESOC_PWR_OFF:
++		mdm_disable_irqs(mdm);
++		mdm->debug = 0;
++		mdm->ready = false;
++		mdm->trig_cnt = 0;
++		if (esoc->primary)
++			break;
++		graceful_shutdown = true;
++		/* as a part of the sysmon rproc subdevice we send
++		 * the power off request so nothing to do here
++		 */
++		if (esoc->userspace_handle_shutdown)
++			esoc_clink_queue_request(ESOC_REQ_SEND_SHUTDOWN, esoc);
++		break;
++	case ESOC_FORCE_PWR_OFF:
++		if (!qcom_sysmon_shutdown_acked(esoc->rproc_sysmon)) {
++			mdm_disable_irqs(mdm);
++			mdm->debug = 0;
++			mdm->ready = false;
++			mdm->trig_cnt = 0;
++
++			dev_err(mdm->dev, "Graceful shutdown fail\n");
++		}
++
++		if (esoc->primary)
++			break;
++		/*
++		 * Force a shutdown of the mdm. This is required in order
++		 * to prevent the mdm from immediately powering back on
++		 * after the shutdown. Avoid setting status to 0, if line is
++		 * monitored by multiple mdms(might be wrongly interpreted as
++		 * a primary crash).
++		 */
++		if (!esoc->statusline_not_a_powersource) {
++			esoc_mdm_log("ESOC_FORCE_PWR_OFF: setting AP2MDM_STATUS = 0\n");
++			gpio_set_value(MDM_GPIO(mdm, AP2MDM_STATUS), 0);
++		}
++		esoc_mdm_log("ESOC_FORCE_PWR_OFF: Queueing request: ESOC_REQ_SHUTDOWN\n");
++		esoc_clink_queue_request(ESOC_REQ_SHUTDOWN, esoc);
++		mdm_power_down(mdm);
++		mdm_update_gpio_configs(mdm, GPIO_UPDATE_BOOTING_CONFIG);
++		break;
++	case ESOC_RESET:
++		esoc_mdm_log("ESOC_RESET: Resetting the modem\n");
++		mdm_toggle_soft_reset(mdm, false);
++		break;
++	case ESOC_PREPARE_DEBUG:
++		/*
++		 * disable all irqs except request irq (pblrdy)
++		 * force a reset of the mdm by signaling
++		 * an APQ crash, wait till mdm is ready for ramdumps.
++		 */
++		mdm->ready = false;
++		esoc_mdm_log("ESOC_PREPARE_DEBUG: Cancelling the status check work\n");
++		cancel_delayed_work(&mdm->mdm2ap_status_check_work);
++		if (!mdm->esoc->auto_boot) {
++			esoc_mdm_log("ESOC_PREPARE_DEBUG: setting AP2MDM_ERRFATAL = 1\n");
++			gpio_set_value(MDM_GPIO(mdm, AP2MDM_ERRFATAL), 1);
++			dev_dbg(mdm->dev, "set ap2mdm errfatal to force reset\n");
++			msleep(mdm->ramdump_delay_ms);
++		}
++		break;
++	case ESOC_EXE_DEBUG:
++		mdm->trig_cnt = 0;
++
++		if (mdm->skip_restart_for_mdm_crash)
++			break;
++
++		esoc_mdm_log("ESOC_EXE_DEBUG: Resetting the modem\n");
++		mdm->debug = 1;
++		mdm_toggle_soft_reset(mdm, false);
++		/*
++		 * wait for ramdumps to be collected
++		 * then power down the mdm and switch gpios to booting
++		 * config
++		 */
++		esoc_mdm_log("ESOC_EXE_DEBUG: Waiting for ramdumps to be collected\n");
++		wait_for_completion(&mdm->debug_done);
++		if (mdm->debug_fail) {
++			esoc_mdm_log("ESOC_EXE_DEBUG: Failed to collect the ramdumps\n");
++			dev_err(mdm->dev, "unable to collect ramdumps\n");
++			mdm->debug = 0;
++			return -EIO;
++		}
++		dev_dbg(mdm->dev, "ramdump collection done\n");
++		mdm->debug = 0;
++		init_completion(&mdm->debug_done);
++		break;
++	case ESOC_EXIT_DEBUG:
++		/*
++		 * Drive STATUS low before deasserting ERR_FATAL so the modem
++		 * sees a clean 0→1 transition when ESOC_PWR_ON raises it
++		 * after the warm reset.  Without this, the modem stays in
++		 * debug/crash mode and ignores the subsequent SPMI reset.
++		 */
++		esoc_mdm_log("ESOC_EXIT_DEBUG: Setting AP2MDM_STATUS = 0\n");
++		gpio_set_value(MDM_GPIO(mdm, AP2MDM_STATUS), 0);
++		/* Let the modem detect the STATUS edge before reset */
++		usleep_range(2000, 3000);
++		esoc_mdm_log("ESOC_EXIT_DEBUG: Setting AP2MDM_ERRFATAL = 0\n");
++		gpio_set_value(MDM_GPIO(mdm, AP2MDM_ERRFATAL), 0);
++		dev_dbg(mdm->dev, "exiting debug state after power on\n");
++		mdm->get_restart_reason = true;
++		break;
++	default:
++		esoc_mdm_log("Invalid command\n");
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static void mdm2ap_status_check(struct work_struct *work)
++{
++	struct mdm_ctrl *mdm = container_of(work, struct mdm_ctrl, mdm2ap_status_check_work.work);
++	struct device *dev = mdm->dev;
++	struct esoc_clink *esoc = mdm->esoc;
++
++	esoc_mdm_log("Powerup timer expired after images are transferred to modem\n");
++	mdm_trace_state(mdm, "status-check timeout");
++
++	if (gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS)) == 0) {
++		esoc_mdm_log("MDM2AP_STATUS did not go high\n");
++		dev_dbg(dev, "MDM2AP_STATUS did not go high\n");
++		esoc_clink_evt_notify(ESOC_UNEXPECTED_RESET, esoc);
++	}
++}
++
++static void mdm_status_fn(struct work_struct *work)
++{
++	struct mdm_ctrl *mdm = container_of(work, struct mdm_ctrl, mdm_status_work);
++	struct device *dev = mdm->dev;
++	int value = gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS));
++
++	dev_dbg(dev, "%s: status:%d\n", __func__, value);
++	mdm_trace_state(mdm, "mdm_status_fn");
++	/* Update gpio configuration to "running" config. */
++	mdm_update_gpio_configs(mdm, GPIO_UPDATE_RUNNING_CONFIG);
++}
++
++static void mdm_get_restart_reason(struct work_struct *work)
++{
++
++	int ret = 0;
++	int ntries = 0;
++	char sfr_buf[RD_BUF_SIZE];
++	struct mdm_ctrl *mdm = container_of(work, struct mdm_ctrl, restart_reason_work);
++	struct device *dev = mdm->dev;
++
++	do {
++		ret = qcom_sysmon_get_reason(mdm->esoc->rproc_sysmon, sfr_buf,
++					    sizeof(sfr_buf));
++		if (!ret) {
++			esoc_mdm_log("restart reason is %s\n", sfr_buf);
++			dev_err(dev, "mdm restart reason is %s\n", sfr_buf);
++			break;
++		}
++		msleep(SFR_RETRY_INTERVAL);
++	} while (++ntries < SFR_MAX_RETRIES);
++	if (ntries == SFR_MAX_RETRIES) {
++		esoc_mdm_log("restart reason not obtained. err:\n");
++		dev_dbg(dev, "%s: Error retrieving restart reason:\n",
++						__func__);
++	}
++	mdm->get_restart_reason = false;
++
++}
++
++void mdm_wait_for_status_low(struct mdm_ctrl *mdm, bool atomic)
++{
++	uint64_t timeout;
++	uint64_t now;
++
++	esoc_mdm_log("Waiting for MDM2AP_STATUS to go LOW\n");
++	timeout = local_clock();
++	do_div(timeout, NSEC_PER_MSEC);
++	timeout += MDM_MODEM_TIMEOUT;
++	do {
++		if (gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS)) == 0) {
++			esoc_mdm_log("MDM2AP_STATUS went LOW\n");
++			return;
++		}
++		now = local_clock();
++		do_div(now, NSEC_PER_MSEC);
++	} while (!time_after64(now, timeout));
++
++	esoc_mdm_log("MDM2AP_STATUS didn't go LOW. Warm-resetting modem\n");
++	dev_err(mdm->dev, "MDM2AP status did not go low\n");
++
++	mdm_toggle_soft_reset(mdm, atomic);
++}
++
++static void mdm_notify(enum esoc_notify notify, struct esoc_clink *esoc)
++{
++	struct mdm_ctrl *mdm = get_esoc_clink_data(esoc);
++	struct device *dev = mdm->dev;
++
++	esoc_mdm_log("Notification: %d\n", notify);
++
++	switch (notify) {
++	case ESOC_IMG_XFER_DONE:
++		mdm_trace_state(mdm, "notify XFER_DONE");
++		if (gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS)) ==  0) {
++			esoc_mdm_log(
++			"ESOC_IMG_XFER_DONE: Begin timeout of %lu ms for modem_status\n",
++			MDM2AP_STATUS_TIMEOUT_MS);
++			schedule_delayed_work(&mdm->mdm2ap_status_check_work,
++				msecs_to_jiffies(MDM2AP_STATUS_TIMEOUT_MS));
++		}
++		break;
++	case ESOC_BOOT_DONE:
++		mdm_trace_state(mdm, "notify BOOT_DONE");
++		mdm->needs_hard_reset = false;
++		esoc_mdm_log("ESOC_BOOT_DONE: Sending the notification: ESOC_RUN_STATE\n");
++		esoc_clink_evt_notify(ESOC_RUN_STATE, esoc);
++		break;
++	case ESOC_IMG_XFER_RETRY:
++		esoc_mdm_log("ESOC_IMG_XFER_RETRY: Resetting the device\n");
++		mdm->init = 1;
++		mdm_toggle_soft_reset(mdm, false);
++		break;
++	case ESOC_IMG_XFER_FAIL:
++		esoc_mdm_log("ESOC_IMG_XFER_FAIL: Send notification: ESOC_INVALID_STATE\n");
++		esoc_clink_evt_notify(ESOC_INVALID_STATE, esoc);
++		break;
++	case ESOC_BOOT_FAIL:
++		esoc_mdm_log("ESOC_BOOT_FAIL: Send notification: ESOC_INVALID_STATE\n");
++		esoc_clink_evt_notify(ESOC_INVALID_STATE, esoc);
++		break;
++	case ESOC_PON_RETRY:
++		esoc_mdm_log("ESOC_PON_RETRY: Send notification: ESOC_RETRY_PON_EVT\n");
++		esoc_clink_evt_notify(ESOC_RETRY_PON_EVT, esoc);
++		break;
++	case ESOC_UPGRADE_AVAILABLE:
++		break;
++	case ESOC_DEBUG_DONE:
++		esoc_mdm_log("ESOC_DEBUG_DONE: Ramdumps collection done\n");
++		mdm->debug_fail = false;
++		mdm_update_gpio_configs(mdm, GPIO_UPDATE_BOOTING_CONFIG);
++		complete(&mdm->debug_done);
++		break;
++	case ESOC_DEBUG_FAIL:
++		esoc_mdm_log("ESOC_DEBUG_FAIL: Ramdumps collection failed\n");
++		mdm->debug_fail = true;
++		complete(&mdm->debug_done);
++		break;
++	case ESOC_PRIMARY_CRASH:
++		mdm_disable_irqs(mdm);
++		dev_dbg(dev, "signal apq err fatal for graceful restart\n");
++		esoc_mdm_log("ESOC_PRIMARY_CRASH: Setting AP2MDM_ERRFATAL = 1\n");
++		gpio_set_value(MDM_GPIO(mdm, AP2MDM_ERRFATAL), 1);
++		if (esoc->primary)
++			break;
++		mdm_wait_for_status_low(mdm, true);
++		break;
++	case ESOC_PRIMARY_REBOOT:
++		mdm_disable_irqs(mdm);
++		mdm->debug = 0;
++		mdm->ready = false;
++		esoc_mdm_log("ESOC_PRIMARY_REBOOT: Powering down the modem\n");
++		mdm_power_down(mdm);
++		break;
++	}
++}
++
++static irqreturn_t mdm_errfatal(int irq, void *dev_id)
++{
++	struct mdm_ctrl *mdm = (struct mdm_ctrl *)dev_id;
++	struct esoc_clink *esoc;
++	struct device *dev;
++
++	if (!mdm)
++		goto no_mdm_irq;
++	dev = mdm->dev;
++	if (!mdm->ready)
++		goto mdm_pwroff_irq;
++	esoc = mdm->esoc;
++	esoc_mdm_log("MDM2AP_ERRFATAL IRQ received!\n");
++	dev_err(dev, "%s: mdm sent errfatal interrupt\n",
++					__func__);
++	mdm->get_restart_reason = true;
++		mdm->needs_hard_reset = true;
++	queue_work(mdm->mdm_queue, &mdm->restart_reason_work);
++	/* disable irq ?*/
++	esoc_clink_evt_notify(ESOC_ERR_FATAL, esoc);
++	return IRQ_HANDLED;
++mdm_pwroff_irq:
++	esoc_mdm_log("MDM2AP_ERRFATAL IRQ received before modem booted. Ignoring.\n");
++	dev_info(dev, "errfatal irq when in pwroff\n");
++no_mdm_irq:
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t mdm_status_change(int irq, void *dev_id)
++{
++	int value;
++	struct esoc_clink *esoc;
++	struct device *dev;
++	struct mdm_ctrl *mdm = (struct mdm_ctrl *)dev_id;
++
++	if (!mdm)
++		return IRQ_HANDLED;
++	dev = mdm->dev;
++	esoc = mdm->esoc;
++	esoc_mdm_log("MDM2AP_STATUS IRQ received!\n");
++	mdm_trace_state(mdm, "status IRQ");
++	/*
++	 * On auto boot devices, there is a possibility of receiving
++	 * status change interrupt before esoc_clink structure is
++	 * initialized. Ignore them.
++	 */
++	if (!esoc) {
++		esoc_mdm_log("Unexpected IRQ. Ignoring.\n");
++		return IRQ_HANDLED;
++	}
++	value = gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS));
++	if (value == 0 && mdm->ready) {
++		esoc_mdm_log("Unexpected reset of external modem\n");
++		dev_err(dev, "unexpected reset external modem\n");
++		mdm->get_restart_reason = true;
++		mdm->needs_hard_reset = true;
++		queue_work(mdm->mdm_queue, &mdm->restart_reason_work);
++		esoc_clink_evt_notify(ESOC_UNEXPECTED_RESET, esoc);
++	} else if (value == 1) {
++		/*
++		 * In auto_boot cases, bailout early if mdm
++		 * is up already.
++		 */
++		if (esoc->auto_boot && mdm->ready)
++			return IRQ_HANDLED;
++
++		esoc_mdm_log("Modem ready. Cancelling the status_check work\n");
++		cancel_delayed_work(&mdm->mdm2ap_status_check_work);
++		dev_dbg(dev, "status = 1: mdm is now ready\n");
++		mdm->ready = true;
++		esoc_clink_evt_notify(ESOC_BOOT_STATE, esoc);
++		queue_work(mdm->mdm_queue, &mdm->mdm_status_work);
++		if (mdm->get_restart_reason)
++			queue_work(mdm->mdm_queue, &mdm->restart_reason_work);
++		if (esoc->auto_boot)
++			esoc->clink_ops->notify(ESOC_BOOT_DONE, esoc);
++	}
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t mdm_pblrdy_change(int irq, void *dev_id)
++{
++	struct mdm_ctrl *mdm;
++	struct device *dev;
++	struct esoc_clink *esoc;
++
++	mdm = (struct mdm_ctrl *)dev_id;
++	if (!mdm)
++		return IRQ_HANDLED;
++	esoc = mdm->esoc;
++	dev = mdm->dev;
++	dev_dbg(dev, "pbl ready %d:\n", gpio_get_value(MDM_GPIO(mdm, MDM2AP_PBLRDY)));
++	mdm_trace_state(mdm, "pblrdy IRQ");
++	if (mdm->init) {
++		mdm->init = 0;
++		esoc_clink_queue_request(ESOC_REQ_IMG, esoc);
++		return IRQ_HANDLED;
++	}
++	if (mdm->debug)
++		esoc_clink_queue_request(ESOC_REQ_DEBUG, esoc);
++	return IRQ_HANDLED;
++}
++
++static void mdm_get_status(u32 *status, struct esoc_clink *esoc)
++{
++	struct mdm_ctrl *mdm = get_esoc_clink_data(esoc);
++
++	if (gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS)) == 0)
++		*status = 0;
++	else
++		*status = 1;
++}
++
++static void mdm_get_err_fatal(u32 *status, struct esoc_clink *esoc)
++{
++	struct mdm_ctrl *mdm = get_esoc_clink_data(esoc);
++
++	if (gpio_get_value(MDM_GPIO(mdm, MDM2AP_ERRFATAL)) == 0)
++		*status = 0;
++	else
++		*status = 1;
++}
++
++/* Fail if any of the required gpios is absent. */
++static int mdm_dt_parse_gpios(struct mdm_ctrl *mdm)
++{
++	int i, val, rc = 0;
++	struct device_node *node = mdm->dev->of_node;
++
++	for (i = 0; i < NUM_GPIOS; i++)
++		mdm->gpios[i] = INVALID_GPIO;
++
++	for (i = 0; i < ARRAY_SIZE(gpio_map); i++) {
++		val = of_get_named_gpio(node, gpio_map[i].name, 0);
++		if (val >= 0)
++			MDM_GPIO(mdm, gpio_map[i].index) = val;
++	}
++	/* These two are special because they can be inverted. */
++	/* Verify that the required gpios have valid values */
++	for (i = 0; i < ARRAY_SIZE(required_gpios); i++) {
++		if (MDM_GPIO(mdm, required_gpios[i]) == INVALID_GPIO) {
++			rc = -ENXIO;
++			break;
++		}
++	}
++	mdm_debug_gpio_show(mdm);
++	return rc;
++}
++
++static int mdm_configure_ipc(struct mdm_ctrl *mdm, struct platform_device *pdev)
++{
++	int ret = -1;
++	int irq;
++	struct device *dev = mdm->dev;
++	struct device_node *node = pdev->dev.of_node;
++
++	ret = of_property_read_u32(node, "qcom,ramdump-timeout-ms", &mdm->dump_timeout_ms);
++	if (ret)
++		mdm->dump_timeout_ms = DEF_RAMDUMP_TIMEOUT;
++	ret = of_property_read_u32(node, "qcom,ramdump-delay-ms", &mdm->ramdump_delay_ms);
++	if (ret)
++		mdm->ramdump_delay_ms = DEF_RAMDUMP_DELAY;
++	/*
++	 * In certain scenarios, multiple esoc devices are monitoring
++	 * same AP2MDM_STATUS line. But only one of them will have a
++	 * successful gpio_request call. Initialize gpio only if request
++	 * succeeds.
++	 */
++	if (gpio_request(MDM_GPIO(mdm, AP2MDM_STATUS), "AP2MDM_STATUS"))
++		dev_err(dev, "Failed to configure AP2MDM_STATUS gpio\n");
++	else
++		gpio_direction_output(MDM_GPIO(mdm, AP2MDM_STATUS), 0);
++	if (gpio_request(MDM_GPIO(mdm, AP2MDM_ERRFATAL), "AP2MDM_ERRFATAL"))
++		dev_err(dev, "%s Failed to configure AP2MDM_ERRFATAL gpio\n", __func__);
++	else
++		gpio_direction_output(MDM_GPIO(mdm, AP2MDM_ERRFATAL), 0);
++	if (gpio_request(MDM_GPIO(mdm, MDM2AP_STATUS), "MDM2AP_STATUS")) {
++		dev_err(dev, "%s Failed to configure MDM2AP_STATUS gpio\n", __func__);
++		goto fatal_err;
++	}
++	if (gpio_request(MDM_GPIO(mdm, MDM2AP_ERRFATAL), "MDM2AP_ERRFATAL")) {
++		dev_err(dev, "%s Failed to configure MDM2AP_ERRFATAL gpio\n", __func__);
++		goto fatal_err;
++	}
++	if (gpio_is_valid(MDM_GPIO(mdm, MDM2AP_PBLRDY))) {
++		if (gpio_request(MDM_GPIO(mdm, MDM2AP_PBLRDY), "MDM2AP_PBLRDY")) {
++			dev_err(dev, "Cannot configure MDM2AP_PBLRDY gpio\n");
++			goto fatal_err;
++		}
++	}
++	if (gpio_is_valid(MDM_GPIO(mdm, AP2MDM_WAKEUP))) {
++		if (gpio_request(MDM_GPIO(mdm, AP2MDM_WAKEUP), "AP2MDM_WAKEUP")) {
++			dev_err(dev, "Cannot configure AP2MDM_WAKEUP gpio\n");
++			goto fatal_err;
++		}
++	}
++	if (gpio_is_valid(MDM_GPIO(mdm, AP2MDM_CHNLRDY))) {
++		if (gpio_request(MDM_GPIO(mdm, AP2MDM_CHNLRDY), "AP2MDM_CHNLRDY")) {
++			dev_err(dev, "Cannot configure AP2MDM_CHNLRDY gpio\n");
++			goto fatal_err;
++		}
++	}
++
++	if (gpio_is_valid(MDM_GPIO(mdm, AP2MDM_CHNLRDY)))
++		gpio_direction_output(MDM_GPIO(mdm, AP2MDM_CHNLRDY), 0);
++
++	gpio_direction_input(MDM_GPIO(mdm, MDM2AP_STATUS));
++	gpio_direction_input(MDM_GPIO(mdm, MDM2AP_ERRFATAL));
++
++	/* ERR_FATAL irq. */
++	irq = gpio_to_irq(MDM_GPIO(mdm, MDM2AP_ERRFATAL));
++	if (irq < 0) {
++		dev_err(dev, "bad MDM2AP_ERRFATAL IRQ resource\n");
++		goto errfatal_err;
++
++	}
++	ret = request_irq(irq, mdm_errfatal, IRQF_TRIGGER_RISING, "mdm errfatal", mdm);
++
++	if (ret < 0) {
++		dev_err(dev, "%s: MDM2AP_ERRFATAL IRQ#%d request failed,\n", __func__, irq);
++		goto errfatal_err;
++	}
++	mdm->errfatal_irq = irq;
++	irq_set_irq_wake(mdm->errfatal_irq, 1);
++
++errfatal_err:
++	 /* status irq */
++	irq = gpio_to_irq(MDM_GPIO(mdm, MDM2AP_STATUS));
++	if (irq < 0) {
++		dev_err(dev, "%s: bad MDM2AP_STATUS IRQ resource, err = %d\n", __func__, irq);
++		goto status_err;
++	}
++	ret = request_threaded_irq(irq, NULL, mdm_status_change,
++		IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT, "mdm status", mdm);
++	if (ret < 0) {
++		dev_err(dev, "%s: MDM2AP_STATUS IRQ#%d request failed, err=%d\n",
++			__func__, irq, ret);
++		goto status_err;
++	}
++	mdm->status_irq = irq;
++	irq_set_irq_wake(mdm->status_irq, 1);
++status_err:
++	if (gpio_is_valid(MDM_GPIO(mdm, MDM2AP_PBLRDY))) {
++		irq =  platform_get_irq_byname(pdev, "plbrdy_irq");
++		if (irq < 0) {
++			dev_err(dev, "%s: MDM2AP_PBLRDY IRQ request failed\n", __func__);
++			goto pblrdy_err;
++		}
++
++		ret = request_threaded_irq(irq, NULL, mdm_pblrdy_change,
++				IRQF_TRIGGER_RISING | IRQF_ONESHOT,
++				"mdm pbl ready", mdm);
++		if (ret < 0) {
++			dev_err(dev, "MDM2AP_PBL IRQ#%d request failed %d\n", irq, ret);
++			goto pblrdy_err;
++		}
++		mdm->pblrdy_irq = irq;
++	}
++	mdm_disable_irqs(mdm);
++pblrdy_err:
++	return 0;
++fatal_err:
++	mdm_deconfigure_ipc(mdm);
++	return ret;
++
++}
++
++static int mdm_pinctrl_init(struct mdm_ctrl *mdm)
++{
++	int retval = 0;
++
++	mdm->pinctrl = devm_pinctrl_get(mdm->dev);
++	if (IS_ERR_OR_NULL(mdm->pinctrl)) {
++		retval = PTR_ERR(mdm->pinctrl);
++		goto err_state_suspend;
++	}
++	mdm->gpio_state_booting = pinctrl_lookup_state(mdm->pinctrl, "mdm_booting");
++	if (IS_ERR_OR_NULL(mdm->gpio_state_booting)) {
++		mdm->gpio_state_running = NULL;
++		mdm->gpio_state_booting = NULL;
++	} else {
++		mdm->gpio_state_running = pinctrl_lookup_state(mdm->pinctrl, "mdm_running");
++		if (IS_ERR_OR_NULL(mdm->gpio_state_running)) {
++			mdm->gpio_state_booting = NULL;
++			mdm->gpio_state_running = NULL;
++		}
++	}
++	mdm->gpio_state_active = pinctrl_lookup_state(mdm->pinctrl, "mdm_active");
++	if (IS_ERR_OR_NULL(mdm->gpio_state_active)) {
++		retval = PTR_ERR(mdm->gpio_state_active);
++		goto err_state_active;
++	}
++	mdm->gpio_state_suspend = pinctrl_lookup_state(mdm->pinctrl, "mdm_suspend");
++	if (IS_ERR_OR_NULL(mdm->gpio_state_suspend)) {
++		retval = PTR_ERR(mdm->gpio_state_suspend);
++		goto err_state_suspend;
++	}
++	retval = pinctrl_select_state(mdm->pinctrl, mdm->gpio_state_active);
++	return retval;
++
++err_state_suspend:
++	mdm->gpio_state_active = NULL;
++err_state_active:
++	mdm->gpio_state_suspend = NULL;
++	mdm->gpio_state_booting = NULL;
++	mdm->gpio_state_running = NULL;
++	return retval;
++}
++
++static void mdm_release_ipc_gpio(struct mdm_ctrl *mdm)
++{
++	int i;
++
++	if (!mdm)
++		return;
++
++	for (i = 0; i < NUM_GPIOS; ++i)
++		if (gpio_is_valid(MDM_GPIO(mdm, i)))
++			gpio_free(MDM_GPIO(mdm, i));
++}
++
++static void mdm_free_irq(struct mdm_ctrl *mdm)
++{
++	if (!mdm)
++		return;
++
++	free_irq(mdm->errfatal_irq, mdm);
++	free_irq(mdm->status_irq, mdm);
++}
++
++static int mdm9x55_setup_hw(struct mdm_ctrl *mdm,
++					const struct mdm_ops *ops,
++					struct platform_device *pdev)
++{
++	int ret;
++	struct device_node *node;
++	struct esoc_clink *esoc;
++	const struct esoc_clink_ops *const clink_ops = ops->clink_ops;
++	const struct mdm_pon_ops *pon_ops = ops->pon_ops;
++
++	mdm->dev = &pdev->dev;
++	mdm->pon_ops = pon_ops;
++	node = pdev->dev.of_node;
++	esoc = devm_kzalloc(mdm->dev, sizeof(*esoc), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(esoc)) {
++		dev_err(mdm->dev, "cannot allocate esoc device\n");
++		return PTR_ERR(esoc);
++	}
++	esoc->pdev = pdev;
++	mdm->mdm_queue = alloc_workqueue("mdm_queue", 0, 0);
++	if (!mdm->mdm_queue) {
++		dev_err(mdm->dev, "could not create mdm_queue\n");
++		return -ENOMEM;
++	}
++	mdm->irq_mask = 0;
++	mdm->ready = false;
++	ret = mdm_dt_parse_gpios(mdm);
++	if (ret)
++		return ret;
++	dev_dbg(mdm->dev, "parsing gpio done\n");
++	ret = mdm_pon_dt_init(mdm);
++	if (ret)
++		return ret;
++	dev_dbg(mdm->dev, "pon dt init done\n");
++	ret = mdm_pinctrl_init(mdm);
++	if (ret)
++		return ret;
++	dev_dbg(mdm->dev, "pinctrl init done\n");
++	ret = mdm_pon_setup(mdm);
++	if (ret)
++		return ret;
++	dev_dbg(mdm->dev, "pon setup done\n");
++	ret = mdm_configure_ipc(mdm, pdev);
++	if (ret)
++		return ret;
++	dev_dbg(mdm->dev, "ipc configure done\n");
++	esoc->name = MDM9x55_LABEL;
++	mdm->dual_interface = of_property_read_bool(node, "qcom,mdm-dual-link");
++	esoc->link_name = MDM9x55_PCIE;
++	ret = of_property_read_string(node, "qcom,mdm-link-info", &esoc->link_info);
++	if (ret)
++		dev_info(mdm->dev, "esoc link info missing\n");
++
++	ret = of_property_read_u32(node, "qcom,shutdown-timeout-ms", &mdm->shutdown_timeout_ms);
++	if (ret)
++		mdm->shutdown_timeout_ms = DEF_SHUTDOWN_TIMEOUT;
++
++	ret = of_property_read_u32(node, "qcom,ssctl-instance-id", &esoc->ssctl_id);
++	if (ret)
++		dev_info(mdm->dev, "esoc ssctl id missing\n");
++
++	esoc->sysmon_name = MDM9x55_LABEL;
++	esoc->clink_ops = clink_ops;
++	esoc->parent = mdm->dev;
++	esoc->owner = THIS_MODULE;
++	esoc->np = pdev->dev.of_node;
++
++	esoc->auto_boot = of_property_read_bool(esoc->np, "qcom,mdm-auto-boot");
++	esoc->statusline_not_a_powersource = of_property_read_bool(esoc->np,
++				"qcom,mdm-statusline-not-a-powersource");
++	esoc->userspace_handle_shutdown = of_property_read_bool(esoc->np,
++				"qcom,mdm-userspace-handle-shutdown");
++	set_esoc_clink_data(esoc, mdm);
++	ret = esoc_clink_register(esoc);
++	if (ret) {
++		dev_err(mdm->dev, "esoc registration failed\n");
++		return ret;
++	}
++	dev_dbg(mdm->dev, "esoc registration done\n");
++	init_completion(&mdm->debug_done);
++	INIT_WORK(&mdm->mdm_status_work, mdm_status_fn);
++	INIT_WORK(&mdm->restart_reason_work, mdm_get_restart_reason);
++	INIT_DELAYED_WORK(&mdm->mdm2ap_status_check_work, mdm2ap_status_check);
++	mdm->get_restart_reason = false;
++	mdm->debug_fail = false;
++	mdm->esoc = esoc;
++	mdm->init = 0;
++	if (esoc->auto_boot)
++		gpio_direction_output(MDM_GPIO(mdm, AP2MDM_STATUS), 1);
++	return 0;
++}
++
++static int sdx_setup_hw(struct mdm_ctrl *mdm, const struct mdm_ops *ops,
++			   struct platform_device *pdev, struct esoc_clink *esoc)
++{
++	int ret;
++	struct device_node *node;
++	const struct esoc_clink_ops *const clink_ops = ops->clink_ops;
++	const struct mdm_pon_ops *pon_ops = ops->pon_ops;
++
++	mdm->dev = &pdev->dev;
++	mdm->pon_ops = pon_ops;
++	node = pdev->dev.of_node;
++	esoc->pdev = pdev;
++
++	mdm->mdm_queue = alloc_workqueue("mdm_queue", 0, 0);
++	if (!mdm->mdm_queue) {
++		dev_err(mdm->dev, "could not create mdm_queue\n");
++		return -ENOMEM;
++	}
++
++	mdm->irq_mask = 0;
++	mdm->ready = false;
++
++	ret = mdm_dt_parse_gpios(mdm);
++	if (ret) {
++		esoc_mdm_log("Failed to parse DT gpios\n");
++		dev_err(mdm->dev, "Failed to parse DT gpios\n");
++		goto err_destroy_wrkq;
++	}
++
++	ret = mdm_pon_dt_init(mdm);
++	if (ret) {
++		esoc_mdm_log("Failed to parse PON DT gpios\n");
++		dev_err(mdm->dev, "Failed to parse PON DT gpio\n");
++		goto err_destroy_wrkq;
++	}
++
++	ret = mdm_pinctrl_init(mdm);
++	if (ret) {
++		esoc_mdm_log("Failed to init pinctrl\n");
++		dev_err(mdm->dev, "Failed to init pinctrl\n");
++		goto err_destroy_wrkq;
++	}
++
++	ret = mdm_pon_setup(mdm);
++	if (ret) {
++		esoc_mdm_log("Failed to setup PON\n");
++		dev_err(mdm->dev, "Failed to setup PON\n");
++		goto err_destroy_wrkq;
++	}
++
++	ret = mdm_configure_ipc(mdm, pdev);
++	if (ret) {
++		esoc_mdm_log("Failed to configure the ipc\n");
++		dev_err(mdm->dev, "Failed to configure the ipc\n");
++		goto err_release_ipc;
++	}
++
++	mdm->dual_interface = of_property_read_bool(node, "qcom,mdm-dual-link");
++	ret = of_property_read_string(node, "qcom,mdm-link-info", &esoc->link_info);
++	if (ret)
++		dev_info(mdm->dev, "esoc link info missing\n");
++
++	mdm->skip_restart_for_mdm_crash = of_property_read_bool(node,
++				"qcom,esoc-skip-restart-for-mdm-crash");
++
++	ret = of_property_read_u32(node, "qcom,ssctl-instance-id", &esoc->ssctl_id);
++	if (ret)
++		dev_info(mdm->dev, "esoc ssctl id missing\n");
++
++	esoc->clink_ops = clink_ops;
++	esoc->parent = mdm->dev;
++	esoc->owner = THIS_MODULE;
++	esoc->np = pdev->dev.of_node;
++	set_esoc_clink_data(esoc, mdm);
++
++	ret = esoc_clink_register(esoc);
++	if (ret) {
++		esoc_mdm_log("esoc registration failed\n");
++		dev_err(mdm->dev, "esoc registration failed\n");
++		goto err_free_irq;
++	}
++	dev_dbg(mdm->dev, "esoc registration done\n");
++	esoc_mdm_log("Done configuring the GPIOs and esoc registration\n");
++
++	init_completion(&mdm->debug_done);
++	INIT_WORK(&mdm->mdm_status_work, mdm_status_fn);
++	INIT_WORK(&mdm->restart_reason_work, mdm_get_restart_reason);
++	INIT_DELAYED_WORK(&mdm->mdm2ap_status_check_work, mdm2ap_status_check);
++	mdm->get_restart_reason = false;
++	mdm->debug_fail = false;
++	mdm->esoc = esoc;
++	mdm->init = 0;
++
++	mdm_debug_gpio_ipc_log(mdm);
++
++	return 0;
++
++err_free_irq:
++	mdm_free_irq(mdm);
++err_release_ipc:
++	mdm_release_ipc_gpio(mdm);
++err_destroy_wrkq:
++	destroy_workqueue(mdm->mdm_queue);
++	return ret;
++}
++
++static int sdx50m_setup_hw(struct mdm_ctrl *mdm, const struct mdm_ops *ops,
++			   struct platform_device *pdev)
++{
++	struct esoc_clink *esoc;
++
++	esoc = devm_kzalloc(&pdev->dev, sizeof(*esoc), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(esoc)) {
++		dev_err(mdm->dev, "cannot allocate esoc device\n");
++		return PTR_ERR(esoc);
++	}
++
++	esoc->name = SDX50M_LABEL;
++	esoc->link_name = SDX50M_PCIE;
++	esoc->sysmon_name = SDX50M_LABEL;
++
++	return sdx_setup_hw(mdm, ops, pdev, esoc);
++}
++
++static int sdx55m_setup_hw(struct mdm_ctrl *mdm, const struct mdm_ops *ops,
++			   struct platform_device *pdev)
++{
++	int ret;
++	struct device_node *node;
++	struct esoc_clink *esoc;
++	const struct esoc_clink_ops *const clink_ops = ops->clink_ops;
++	const struct mdm_pon_ops *pon_ops = ops->pon_ops;
++
++	mdm->dev = &pdev->dev;
++	mdm->pon_ops = pon_ops;
++	node = pdev->dev.of_node;
++
++	esoc = devm_kzalloc(mdm->dev, sizeof(*esoc), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(esoc)) {
++		dev_err(mdm->dev, "cannot allocate esoc device\n");
++		return PTR_ERR(esoc);
++	}
++	esoc->pdev = pdev;
++
++	mdm->mdm_queue = alloc_workqueue("mdm_queue", 0, 0);
++	if (!mdm->mdm_queue) {
++		dev_err(mdm->dev, "could not create mdm_queue\n");
++		return -ENOMEM;
++	}
++
++	mdm->irq_mask = 0;
++	mdm->ready = false;
++
++	ret = mdm_dt_parse_gpios(mdm);
++	if (ret) {
++		esoc_mdm_log("Failed to parse DT gpios\n");
++		dev_err(mdm->dev, "Failed to parse DT gpios\n");
++		goto err_destroy_wrkq;
++	}
++
++	ret = mdm_pinctrl_init(mdm);
++	if (ret) {
++		esoc_mdm_log("Failed to init pinctrl\n");
++		dev_err(mdm->dev, "Failed to init pinctrl\n");
++		goto err_destroy_wrkq;
++	}
++
++	ret = mdm_configure_ipc(mdm, pdev);
++	if (ret) {
++		esoc_mdm_log("Failed to configure the ipc\n");
++		dev_err(mdm->dev, "Failed to configure the ipc\n");
++		goto err_release_ipc;
++	}
++
++	esoc->name = SDX55M_LABEL;
++	mdm->dual_interface = of_property_read_bool(node, "qcom,mdm-dual-link");
++	esoc->link_name = SDX55M_PCIE;
++	ret = of_property_read_string(node, "qcom,mdm-link-info", &esoc->link_info);
++	if (ret)
++		dev_info(mdm->dev, "esoc link info missing\n");
++
++	mdm->skip_restart_for_mdm_crash = of_property_read_bool(node,
++				"qcom,esoc-skip-restart-for-mdm-crash");
++
++	ret = of_property_read_u32(node, "qcom,ssctl-instance-id", &esoc->ssctl_id);
++	if (ret)
++		dev_info(mdm->dev, "esoc ssctl id missing\n");
++
++	/*
++	 * The name here goes out to the other subsystems, which recognise the
++	 * external modem as "esoc0" and nothing else. The audio DSP is the one
++	 * that cares: its MVM waits for SYS_M_SSR_EXT_MODEM_AFTER_POWERUP before
++	 * it will hand the modem the voice mailbox, and it matches that on the
++	 * subsystem name carried in the notification. Announcing "SDX55M" left
++	 * the DSP believing the modem had never come up, so it stored the
++	 * mailbox configuration the AP gave it and then refused to answer the
++	 * modem's request for it -- a five second timeout in the modem's voice
++	 * service and a silent call. Both firmwares list ssr:esoc0:after_powerup
++	 * and ssr:esoc0:after_shutdown; neither has ever heard of SDX55M.
++	 */
++	esoc->sysmon_name = ESOC0_LABEL;
++	esoc->clink_ops = clink_ops;
++	esoc->parent = mdm->dev;
++	esoc->owner = THIS_MODULE;
++	esoc->np = pdev->dev.of_node;
++	set_esoc_clink_data(esoc, mdm);
++
++	ret = esoc_clink_register(esoc);
++	if (ret) {
++		esoc_mdm_log("esoc registration failed\n");
++		dev_err(mdm->dev, "esoc registration failed\n");
++		goto err_free_irq;
++	}
++	dev_dbg(mdm->dev, "esoc registration done\n");
++	esoc_mdm_log("Done configuring the GPIOs and esoc registration\n");
++
++	init_completion(&mdm->debug_done);
++	INIT_WORK(&mdm->mdm_status_work, mdm_status_fn);
++	INIT_WORK(&mdm->restart_reason_work, mdm_get_restart_reason);
++	INIT_DELAYED_WORK(&mdm->mdm2ap_status_check_work, mdm2ap_status_check);
++	mdm->get_restart_reason = false;
++	mdm->debug_fail = false;
++	mdm->esoc = esoc;
++	mdm->init = 0;
++
++	mdm_debug_gpio_ipc_log(mdm);
++
++	if (esoc->auto_boot)
++		gpio_direction_output(MDM_GPIO(mdm, AP2MDM_STATUS), 1);
++
++	return 0;
++
++err_free_irq:
++	mdm_free_irq(mdm);
++err_release_ipc:
++	mdm_release_ipc_gpio(mdm);
++err_destroy_wrkq:
++	destroy_workqueue(mdm->mdm_queue);
++	return ret;
++}
++
++static int sdx_setup_regulators(struct mdm_ctrl *mdm)
++{
++	int len;
++	int i, rc;
++	char uv_ua[50];
++	u32 uv_ua_vals[2];
++	const char *reg_name;
++
++	mdm->reg_cnt = of_property_count_strings(mdm->dev->of_node, "reg-names");
++	if (mdm->reg_cnt <= 0) {
++		dev_err(mdm->dev, "No regulators for this device\n");
++		esoc_mdm_log("No regulators for %s device\n", mdm->esoc->name);
++		return 0;
++	}
++
++	mdm->regs = devm_kzalloc(mdm->dev, sizeof(struct reg_info) * mdm->reg_cnt, GFP_KERNEL);
++	if (!mdm->regs)
++		return -ENOMEM;
++
++	for (i = 0; i < mdm->reg_cnt; i++) {
++		of_property_read_string_index(mdm->dev->of_node, "reg-names", i, &reg_name);
++
++		mdm->regs[i].reg = devm_regulator_get(mdm->dev, reg_name);
++		if (IS_ERR(mdm->regs[i].reg)) {
++			dev_err(mdm->dev, "failed to get %s reg\n", reg_name);
++			return PTR_ERR(mdm->regs[i].reg);
++		}
++
++		/* Read current(uA) and voltage(uV) value */
++		snprintf(uv_ua, sizeof(uv_ua), "%s-uV-uA", reg_name);
++		if (!of_find_property(mdm->dev->of_node, uv_ua, &len))
++			continue;
++
++		rc = of_property_read_u32_array(mdm->dev->of_node, uv_ua, uv_ua_vals,
++						ARRAY_SIZE(uv_ua_vals));
++		if (rc) {
++			dev_err(mdm->dev, "Failed to read uVuA value(rc:%d)\n", rc);
++			return rc;
++		}
++
++		if (uv_ua_vals[0] > 0)
++			mdm->regs[i].uV = uv_ua_vals[0];
++		if (uv_ua_vals[1] > 0)
++			mdm->regs[i].uA = uv_ua_vals[1];
++	}
++	return 0;
++}
++
++static int lemur_setup_hw(struct mdm_ctrl *mdm, const struct mdm_ops *ops,
++			  struct platform_device *pdev)
++{
++	int ret;
++	struct esoc_clink *esoc;
++
++	/* Same configuration as that of sdx50, except for the name */
++	esoc = devm_kzalloc(&pdev->dev, sizeof(*esoc), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(esoc)) {
++		dev_err(&pdev->dev, "cannot allocate esoc device\n");
++		return PTR_ERR(esoc);
++	}
++
++	esoc->name = LEMUR_LABEL;
++	esoc->link_name = LEMUR_PCIE;
++	esoc->sysmon_name = LEMUR_LABEL;
++
++	ret = sdx_setup_hw(mdm, ops, pdev, esoc);
++	if (ret) {
++		dev_err(mdm->dev, "Hardware setup failed for lemur\n");
++		esoc_mdm_log("Hardware setup failed for lemur\n");
++		return ret;
++	}
++
++	ret = sdx_setup_regulators(mdm);
++	if (ret) {
++		dev_err(mdm->dev, "Failed to setup regulators: %d\n", ret);
++		esoc_mdm_log("Failed to setup regulators: %d\n", ret);
++	}
++
++	esoc_mdm_log("Hardware setup done for lemur\n");
++
++	return ret;
++}
++
++static int pinn_setup_hw(struct mdm_ctrl *mdm, const struct mdm_ops *ops,
++			  struct platform_device *pdev)
++{
++	int ret;
++	struct esoc_clink *esoc;
++
++	/* Same configuration as that of sdx75, except for the name */
++	esoc = devm_kzalloc(&pdev->dev, sizeof(*esoc), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(esoc)) {
++		dev_err(&pdev->dev, "cannot allocate esoc device\n");
++		return PTR_ERR(esoc);
++	}
++
++	esoc->name = PINN_LABEL;
++	esoc->link_name = PINN_PCIE;
++	esoc->sysmon_name = PINN_LABEL;
++
++	ret = sdx_setup_hw(mdm, ops, pdev, esoc);
++	if (ret) {
++		dev_err(mdm->dev, "Hardware setup failed for pinn\n");
++		esoc_mdm_log("Hardware setup failed for pinn\n");
++		return ret;
++	}
++
++	ret = sdx_setup_regulators(mdm);
++	if (ret) {
++		dev_err(mdm->dev, "Failed to setup regulators: %d\n", ret);
++		esoc_mdm_log("Failed to setup regulators: %d\n", ret);
++	}
++
++	esoc_mdm_log("Hardware setup done for pinn\n");
++
++	return ret;
++}
++
++static int baagha_setup_hw(struct mdm_ctrl *mdm, const struct mdm_ops *ops,
++			  struct platform_device *pdev)
++{
++	int ret;
++	struct esoc_clink *esoc;
++
++	/* Same configuration as that of sdx75, except for the name */
++	esoc = devm_kzalloc(&pdev->dev, sizeof(*esoc), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(esoc)) {
++		dev_err(&pdev->dev, "cannot allocate esoc device\n");
++		return PTR_ERR(esoc);
++	}
++
++	esoc->name = BAAGHA_LABEL;
++	esoc->link_name = BAAGHA_PCIE;
++	esoc->sysmon_name = BAAGHA_LABEL;
++
++	ret = sdx_setup_hw(mdm, ops, pdev, esoc);
++	if (ret) {
++		dev_err(mdm->dev, "Hardware setup failed for baagha\n");
++		esoc_mdm_log("Hardware setup failed for baahga\n");
++		return ret;
++	}
++
++	ret = sdx_setup_regulators(mdm);
++	if (ret) {
++		dev_err(mdm->dev, "Failed to setup regulators: %d\n", ret);
++		esoc_mdm_log("Failed to setup regulators: %d\n", ret);
++	}
++
++	esoc_mdm_log("Hardware setup done for baagha\n");
++
++	return ret;
++}
++
++static struct esoc_clink_ops mdm_cops = {
++	.cmd_exe = mdm_cmd_exe,
++	.get_status = mdm_get_status,
++	.get_err_fatal = mdm_get_err_fatal,
++	.notify = mdm_notify,
++};
++
++static struct mdm_ops mdm9x55_ops = {
++	.clink_ops = &mdm_cops,
++	.config_hw = mdm9x55_setup_hw,
++	.pon_ops = &mdm9x55_pon_ops,
++};
++
++static struct mdm_ops sdx50m_ops = {
++	.clink_ops = &mdm_cops,
++	.config_hw = sdx50m_setup_hw,
++	.pon_ops = &sdx50m_pon_ops,
++};
++
++static struct mdm_ops sdx55m_ops = {
++	.clink_ops = &mdm_cops,
++	.config_hw = sdx55m_setup_hw,
++	.pon_ops = &sdx55m_pon_ops,
++};
++
++static struct mdm_ops lemur_ops = {
++	.clink_ops = &mdm_cops,
++	.config_hw = lemur_setup_hw,
++	.pon_ops = &sdx50m_pon_ops,
++};
++
++static struct mdm_ops pinn_ops = {
++	.clink_ops = &mdm_cops,
++	.config_hw = pinn_setup_hw,
++	.pon_ops = &sdx50m_pon_ops,
++};
++
++static struct mdm_ops baagha_ops = {
++	.clink_ops = &mdm_cops,
++	.config_hw = baagha_setup_hw,
++	.pon_ops = &sdx50m_pon_ops,
++};
++
++static const struct of_device_id mdm_dt_match[] = {
++	{ .compatible = "qcom,ext-mdm9x55",
++		.data = &mdm9x55_ops, },
++	{ .compatible = "qcom,ext-sdx50m",
++		.data = &sdx50m_ops, },
++	{ .compatible = "qcom,ext-sdx55m",
++		.data = &sdx55m_ops, },
++	{ .compatible = "qcom,ext-lemur",
++		.data = &lemur_ops, },
++	{ .compatible = "qcom,ext-pinn",
++		.data = &pinn_ops, },
++	{ .compatible = "qcom,ext-baagha",
++		.data = &baagha_ops, },
++	{},
++};
++MODULE_DEVICE_TABLE(of, mdm_dt_match);
++
++static int mdm_probe(struct platform_device *pdev)
++{
++	const struct of_device_id *match;
++	const struct mdm_ops *mdm_ops;
++	struct device_node *node = pdev->dev.of_node;
++	struct mdm_ctrl *mdm;
++	int ret;
++
++	match = of_match_node(mdm_dt_match, node);
++	if (IS_ERR_OR_NULL(match))
++		return PTR_ERR(match);
++	mdm_ops = match->data;
++	mdm = devm_kzalloc(&pdev->dev, sizeof(*mdm), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(mdm))
++		return PTR_ERR(mdm);
++
++	ret = mdm_ops->config_hw(mdm, mdm_ops, pdev);
++
++	platform_set_drvdata(pdev, mdm);
++
++	return ret;
++}
++
++static void mdm_remove(struct platform_device *pdev)
++{
++	struct mdm_ctrl *mdm = platform_get_drvdata(pdev);
++
++	if (mdm->mdm_queue)
++		destroy_workqueue(mdm->mdm_queue);
++
++	esoc_clink_unregister(mdm->esoc);
++}
++
++static struct platform_driver mdm_driver = {
++	.probe		= mdm_probe,
++	.remove		= mdm_remove,
++	.driver = {
++		.name	= "ext-mdm",
++		.of_match_table = of_match_ptr(mdm_dt_match),
++	},
++};
++
++static int __init mdm_register(void)
++{
++	int ret;
++
++	ipc_log = ipc_log_context_create(ESOC_MDM_IPC_PAGES, "esoc-mdm", 0);
++	if (!ipc_log)
++		pr_err("Failed to setup esoc-mdm IPC logging\n");
++
++	ret = esoc_bus_init();
++	if (ret) {
++		pr_err("Failed to initialize esoc bus\n");
++		return ret;
++	}
++
++	return platform_driver_register(&mdm_driver);
++}
++module_init(mdm_register);
++
++static void __exit mdm_unregister(void)
++{
++	platform_driver_unregister(&mdm_driver);
++	esoc_bus_exit();
++	ipc_log_context_destroy(ipc_log);
++}
++
++EXPORT_SYMBOL(ipc_log);
++EXPORT_SYMBOL(mdm_wait_for_status_low);
++EXPORT_SYMBOL(mdm_disable_irqs);
++module_exit(mdm_unregister);
++MODULE_LICENSE("GPL v2");
+--- /dev/null
++++ b/drivers/remoteproc/esoc-mdm-dbg-eng.c
+@@ -0,0 +1,452 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2015, 2017-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++#include <linux/atomic.h>
++#include <linux/debugfs.h>
++#include <linux/device.h>
++#include "esoc.h"
++
++/* esoc debug engine parent dir */
++static struct dentry *esoc_dbg;
++
++/*
++ * cmd_mask : Specifies if a command/notifier is masked, and
++ * whats the trigger value for mask to take effect.
++ * @mask_trigger: trigger value for mask.
++ * @mask: boolean to determine if command should be masked.
++ */
++struct esoc_mask {
++	atomic_t mask_trigger;
++	bool mask;
++};
++
++/*
++ * manual_to_esoc_cmd: Converts a user provided command
++ * to a corresponding esoc command.
++ * @cmd: ESOC command
++ * @manual_cmd: user specified command string.
++ */
++struct manual_to_esoc_cmd {
++	unsigned int cmd;
++	char manual_cmd[20];
++};
++
++/*
++ * manual_to_esoc_notify: Converts a user provided notification
++ * to corresponding esoc notification for Primary SOC.
++ * @notfication: ESOC notification.
++ * @manual_notifier: user specified notification string.
++ */
++struct manual_to_esoc_notify {
++	unsigned int notify;
++	char manual_notify[20];
++};
++
++static const struct manual_to_esoc_cmd cmd_map[] = {
++	{
++		.cmd = ESOC_PWR_ON,
++		.manual_cmd = "PON",
++	},
++	{
++		.cmd = ESOC_PREPARE_DEBUG,
++		.manual_cmd = "ENTER_DLOAD",
++	},
++	{	.cmd = ESOC_PWR_OFF,
++		.manual_cmd = "POFF",
++	},
++	{
++		.cmd = ESOC_FORCE_PWR_OFF,
++		.manual_cmd = "FORCE_POFF",
++	},
++};
++
++static struct esoc_mask cmd_mask[] = {
++	[ESOC_PWR_ON] = {
++		.mask = false,
++		.mask_trigger = ATOMIC_INIT(1),
++	},
++	[ESOC_PREPARE_DEBUG] = {
++		.mask = false,
++		.mask_trigger = ATOMIC_INIT(0),
++	},
++	[ESOC_PWR_OFF] = {
++		.mask = false,
++		.mask_trigger = ATOMIC_INIT(0),
++	},
++	[ESOC_FORCE_PWR_OFF] = {
++		.mask = false,
++		.mask_trigger = ATOMIC_INIT(0),
++	},
++};
++
++static const struct manual_to_esoc_notify notify_map[] = {
++	{
++		.notify = ESOC_PRIMARY_REBOOT,
++		.manual_notify = "REBOOT",
++	},
++	{
++		.notify = ESOC_PRIMARY_CRASH,
++		.manual_notify = "PANIC",
++	},
++};
++
++static struct esoc_mask notify_mask[] = {
++	[ESOC_PRIMARY_REBOOT] = {
++		.mask = false,
++		.mask_trigger = ATOMIC_INIT(0),
++	},
++	[ESOC_PRIMARY_CRASH] = {
++		.mask = false,
++		.mask_trigger = ATOMIC_INIT(0),
++	},
++};
++
++bool dbg_check_cmd_mask(unsigned int cmd)
++{
++	pr_debug("command to mask %d\n", cmd);
++	if (cmd_mask[cmd].mask)
++		return atomic_add_negative(-1, &cmd_mask[cmd].mask_trigger);
++	else
++		return false;
++}
++EXPORT_SYMBOL(dbg_check_cmd_mask);
++
++bool dbg_check_notify_mask(unsigned int notify)
++{
++	pr_debug("notifier to mask %d\n", notify);
++	if (notify_mask[notify].mask)
++		return atomic_add_negative(-1, &notify_mask[notify].mask_trigger);
++	else
++		return false;
++}
++EXPORT_SYMBOL(dbg_check_notify_mask);
++/*
++ * Create driver attributes that let you mask
++ * specific commands.
++ */
++static ssize_t command_mask_write(struct file *filp, const char __user *user_buf, size_t count,
++				  loff_t *ppos)
++{
++	unsigned int cmd, i, ret;
++	char buf[20];
++	size_t len;
++
++	if (!count || count > sizeof(buf) - 1)
++		return -EINVAL;
++
++	ret = copy_from_user(buf, user_buf, count);
++	if (ret)
++		return -EFAULT;
++
++	len = strcspn(buf, "\n");
++	buf[len] = '\0';
++
++	pr_debug("user input command %s\n", buf);
++	for (i = 0; i < ARRAY_SIZE(cmd_map); i++) {
++		if (!strcmp(cmd_map[i].manual_cmd, buf)) {
++			/*
++			 * Map manual command string to ESOC command
++			 * set mask for ESOC command
++			 */
++			cmd = cmd_map[i].cmd;
++			cmd_mask[cmd].mask = true;
++			pr_debug("Setting mask for manual command %s\n", buf);
++			break;
++		}
++	}
++	if (i >= ARRAY_SIZE(cmd_map))
++		pr_err("invalid command specified\n");
++	return count;
++}
++
++static const struct file_operations esoc_cmd_mask_fops = {
++	.write = command_mask_write,
++	.open = simple_open,
++	.llseek = generic_file_llseek,
++};
++
++static ssize_t notifier_mask_write(struct file *filp, const char __user *user_buf, size_t count,
++				  loff_t *ppos)
++{
++	unsigned int notify, i, ret;
++	char buf[20];
++	size_t len;
++
++	if (!count || count > sizeof(buf) - 1)
++		return -EINVAL;
++
++	ret = copy_from_user(buf, user_buf, count);
++	if (ret)
++		return -EFAULT;
++
++	len = strcspn(buf, "\n");
++	buf[len] = '\0';
++
++	pr_debug("user input notifier %s\n", buf);
++	for (i = 0; i < ARRAY_SIZE(notify_map); i++) {
++		if (!strcmp(buf, notify_map[i].manual_notify)) {
++			/*
++			 * Map manual notifier string to primary soc
++			 * notifier. Also set mask for the notifier.
++			 */
++			notify = notify_map[i].notify;
++			notify_mask[notify].mask = true;
++			pr_debug("Setting mask for manual notification %s\n", buf);
++			break;
++		}
++	}
++	if (i >= ARRAY_SIZE(notify_map))
++		pr_err("invalid notifier specified\n");
++	return count;
++}
++
++static const struct file_operations esoc_notifier_mask_fops = {
++	.write = notifier_mask_write,
++	.open = simple_open,
++	.llseek = generic_file_llseek,
++};
++
++/* Last recorded request from esoc */
++static enum esoc_req last_req;
++static DEFINE_SPINLOCK(req_lock);
++/*
++ * esoc_to_user: Conversion of esoc ids to user visible strings
++ * id: esoc request, command, notifier, event id
++ * str: string equivalent of the above
++ */
++struct esoc_to_user {
++	unsigned int id;
++	char str[20];
++};
++
++static struct esoc_to_user in_to_resp[] = {
++	{
++		.id = ESOC_IMG_XFER_DONE,
++		.str = "XFER_DONE",
++	},
++	{
++		.id = ESOC_BOOT_DONE,
++		.str = "BOOT_DONE",
++	},
++	{
++		.id = ESOC_BOOT_FAIL,
++		.str = "BOOT_FAIL",
++	},
++	{
++		.id = ESOC_IMG_XFER_RETRY,
++		.str = "XFER_RETRY",
++	},
++	{	.id = ESOC_IMG_XFER_FAIL,
++		.str = "XFER_FAIL",
++	},
++	{
++		.id = ESOC_UPGRADE_AVAILABLE,
++		.str = "UPGRADE",
++	},
++	{	.id = ESOC_DEBUG_DONE,
++		.str = "DEBUG_DONE",
++	},
++	{
++		.id = ESOC_DEBUG_FAIL,
++		.str = "DEBUG_FAIL",
++	},
++};
++
++static struct esoc_to_user req_to_str[] = {
++	{
++		.id = ESOC_REQ_IMG,
++		.str = "REQ_IMG",
++	},
++	{
++		.id = ESOC_REQ_DEBUG,
++		.str = "REQ_DEBUG",
++	},
++	{
++		.id = ESOC_REQ_SHUTDOWN,
++		.str = "REQ_SHUTDOWN",
++	},
++};
++
++static ssize_t req_eng_resp_write(struct file *filp, const char __user *user_buf, size_t count,
++				  loff_t *ppos)
++{
++	unsigned int i, ret;
++	struct esoc_clink *clink = filp->private_data;
++	const struct esoc_clink_ops *const clink_ops = clink->clink_ops;
++	char buf[20];
++	size_t len;
++
++	if (!count || count > sizeof(buf) - 1)
++		return -EINVAL;
++
++	ret = copy_from_user(buf, user_buf, count);
++	if (ret)
++		return -EFAULT;
++
++	len = strcspn(buf, "\n");
++	buf[len] = '\0';
++
++	dev_dbg(&clink->dev, "user input req eng response %s\n", buf);
++	for (i = 0; i < ARRAY_SIZE(in_to_resp); i++) {
++		size_t len1 = strlen(buf);
++		size_t len2 = strlen(in_to_resp[i].str);
++
++		if (len1 == len2 && !strcmp(buf, in_to_resp[i].str)) {
++			clink_ops->notify(in_to_resp[i].id, clink);
++			break;
++		}
++	}
++	if (i > ARRAY_SIZE(in_to_resp))
++		dev_err(&clink->dev, "Invalid resp %s, specified\n", buf);
++	return count;
++}
++
++static const struct file_operations esoc_req_eng_resp_fops = {
++	.write = req_eng_resp_write,
++	.open = simple_open,
++	.llseek = generic_file_llseek,
++};
++
++static ssize_t last_esoc_req_read(struct file *filp, char __user *user_buf, size_t count,
++				  loff_t *ppos)
++{
++	unsigned int i;
++	unsigned long flags;
++
++	spin_lock_irqsave(&req_lock, flags);
++	for (i = 0; i < ARRAY_SIZE(req_to_str); i++) {
++		if (last_req == req_to_str[i].id) {
++			count = simple_read_from_buffer(user_buf, count, ppos, req_to_str[i].str,
++							strlen(req_to_str[i].str));
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&req_lock, flags);
++	return count;
++}
++
++static const struct file_operations esoc_last_esoc_req_fops = {
++	.read = last_esoc_req_read,
++	.open = simple_open,
++	.llseek = generic_file_llseek,
++};
++
++static void esoc_handle_req(enum esoc_req req, struct esoc_eng *eng)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&req_lock, flags);
++	last_req = req;
++	spin_unlock_irqrestore(&req_lock, flags);
++}
++
++static void esoc_handle_evt(enum esoc_evt evt, struct esoc_eng *eng)
++{
++}
++
++static struct esoc_eng dbg_req_eng = {
++	.handle_clink_req = esoc_handle_req,
++	.handle_clink_evt = esoc_handle_evt,
++};
++
++int register_dbg_req_eng(struct esoc_clink *clink)
++{
++	struct device *dev = &clink->dev;
++	struct dentry *file;
++	int ret;
++
++	if (clink->dbg_dir)
++		return 0;
++
++	clink->dbg_dir = debugfs_create_dir(dev_name(dev), esoc_dbg);
++	if (IS_ERR_OR_NULL(clink->dbg_dir)) {
++		pr_err("can't create debugfs dir: %s\n", dev_name(dev));
++		ret = PTR_ERR(clink->dbg_dir);
++		goto dbg_req_err;
++	}
++
++	file = debugfs_create_file("req_eng_resp", 0600, clink->dbg_dir, clink,
++				   &esoc_req_eng_resp_fops);
++	if (IS_ERR_OR_NULL(file)) {
++		pr_err("Unable to create req_eng_resp file\n");
++		ret = PTR_ERR(file);
++		goto dbg_req_err;
++	}
++
++	file = debugfs_create_file("last_esoc_req", 0400, clink->dbg_dir, clink,
++				   &esoc_last_esoc_req_fops);
++	if (IS_ERR_OR_NULL(file)) {
++		pr_err("Unable to create last_esoc_req file\n");
++		ret = PTR_ERR(file);
++		goto dbg_req_err;
++	}
++
++	ret = esoc_clink_register_req_eng(clink, &dbg_req_eng);
++	if (ret) {
++		pr_err("Unable to register req eng\n");
++		goto dbg_req_err;
++	}
++	spin_lock_init(&req_lock);
++	return 0;
++dbg_req_err:
++	debugfs_remove(clink->dbg_dir);
++	clink->dbg_dir = NULL;
++	return ret;
++}
++
++void unregister_dbg_req_eng(struct esoc_clink *clink)
++{
++	esoc_clink_unregister_req_eng(clink, &dbg_req_eng);
++	debugfs_remove(clink->dbg_dir);
++}
++
++int mdm_dbg_eng_init(void)
++{
++	int ret;
++	struct dentry *file;
++
++	if (!debugfs_initialized())
++		return -EINVAL;
++
++	if (esoc_dbg)
++		return 0;
++
++	esoc_dbg = debugfs_create_dir(KBUILD_MODNAME, NULL);
++	if (IS_ERR_OR_NULL(esoc_dbg)) {
++		pr_err("can't create debugfs dir\n");
++		ret = PTR_ERR(esoc_dbg);
++		goto dbg_eng_fail;
++	}
++
++	file = debugfs_create_file("command_mask", 0600, esoc_dbg, NULL, &esoc_cmd_mask_fops);
++	if (IS_ERR_OR_NULL(file)) {
++		pr_err("Unable to create command mask file\n");
++		ret = PTR_ERR(file);
++		goto dbg_eng_fail;
++	}
++
++	file = debugfs_create_file("notifier_mask", 0600, esoc_dbg, NULL, &esoc_notifier_mask_fops);
++	if (IS_ERR_OR_NULL(file)) {
++		pr_err("Unable to create notify mask file\n");
++		ret = PTR_ERR(file);
++		goto dbg_eng_fail;
++	}
++	return 0;
++dbg_eng_fail:
++	debugfs_remove(esoc_dbg);
++	esoc_dbg = NULL;
++	return ret;
++}
++EXPORT_SYMBOL(mdm_dbg_eng_init);
++
++void mdm_dbg_eng_exit(void)
++{
++	debugfs_remove(esoc_dbg);
++}
++EXPORT_SYMBOL(mdm_dbg_eng_exit);
++EXPORT_SYMBOL(register_dbg_req_eng);
++EXPORT_SYMBOL(unregister_dbg_req_eng);
++
++MODULE_LICENSE("GPL v2");
+--- /dev/null
++++ b/drivers/remoteproc/esoc-mdm-drv.c
+@@ -0,0 +1,722 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2013-2015, 2017-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/delay.h>
++#include <linux/workqueue.h>
++#include <linux/reboot.h>
++#include <linux/of.h>
++#include <linux/esoc_client.h>
++#include "esoc-mdm.h"
++#include "mdm-dbg.h"
++
++/* Default number of powerup trial requests per session */
++#define ESOC_DEF_PON_REQ	3
++
++/*
++ * How long to wait for pon_done before giving up on a boot.
++ *
++ * pon_done is completed by ESOC_RUN_STATE, which for a non-auto_boot esoc only
++ * ever arrives when userspace sends ESOC_BOOT_DONE. Waiting for that forever
++ * (the vendor uses INT_MAX) means any userspace hiccup wedges remoteproc for
++ * good: the wait is uninterruptible and it is held across rproc->lock, so
++ * every later start/stop blocks behind it and no signal can break it out.
++ * A generous bound turns that into an error the caller can retry.
++ *
++ * A healthy boot is ~30 s (PCIe recovery, then ~85 MB of firmware over
++ * Sahara), so this leaves a wide margin.
++ */
++#define PON_DONE_TIMEOUT_MS	(180 * 1000)
++#define ESOC_MAX_PON_TRIES	5
++/*
++ * Panicking the AP because an external modem would not boot is not a
++ * reasonable default on a phone: the modem is a peripheral here, and taking
++ * the whole system down loses the log that would explain the failure. Leave
++ * the modem alone and report the error to whoever asked for the boot.
++ */
++#define BOOT_FAIL_ACTION_DEF	BOOT_FAIL_ACTION_NOP
++#define S3_RESET_DELAY_MS	1000
++
++enum esoc_pon_state {
++	PON_INIT,
++	PON_SUCCESS,
++	PON_RETRY,
++	PON_FAIL
++};
++
++enum {
++	PWR_OFF = 0x1,
++	SHUTDOWN,
++	RESET,
++	PEER_CRASH,
++	IN_DEBUG,
++	CRASH,
++	PWR_ON,
++	BOOT,
++	RUN,
++};
++
++struct mdm_drv_data {
++	const char *fw;
++};
++
++struct mdm_drv {
++	unsigned int mode;
++	struct esoc_eng cmd_eng;
++	struct completion pon_done;
++	struct completion ssr_ready;
++	struct completion req_eng_wait;
++	struct esoc_clink *esoc_clink;
++	enum esoc_pon_state pon_state;
++	struct workqueue_struct *mdm_queue;
++	struct work_struct ssr_work;
++	struct notifier_block esoc_restart;
++	struct mutex poff_lock;
++	atomic_t boot_fail_action;
++	atomic_t n_pon_tries;
++};
++#define to_mdm_drv(d) container_of(d, struct mdm_drv, cmd_eng)
++
++static void esoc_client_link_power_off(struct esoc_clink *esoc_clink, unsigned int flags);
++static void esoc_client_link_mdm_crash(struct esoc_clink *esoc_clink);
++
++int esoc_set_boot_fail_action(struct esoc_clink *esoc_clink, u32 action)
++{
++	struct mdm_drv *mdm_drv = esoc_get_drv_data(esoc_clink);
++
++	if (action >= BOOT_FAIL_ACTION_LAST) {
++		esoc_mdm_log("Unknown boot fail action requested: %u\n", action);
++		return -EINVAL;
++	}
++
++	if (!mdm_drv) {
++		esoc_mdm_log("esoc-mdm driver not present\n");
++		return -EAGAIN;
++	}
++
++	atomic_set(&mdm_drv->boot_fail_action, action);
++	esoc_mdm_log("Boot fail action configured to %u\n", action);
++
++	return 0;
++}
++
++int esoc_set_n_pon_tries(struct esoc_clink *esoc_clink, u32 n_tries)
++{
++	struct mdm_drv *mdm_drv = esoc_get_drv_data(esoc_clink);
++
++	if (n_tries > ESOC_MAX_PON_TRIES) {
++		esoc_mdm_log("Num PON tries requested (%u) is over the limit: %u\n", n_tries,
++			     ESOC_MAX_PON_TRIES);
++	}
++
++	if (!mdm_drv) {
++		esoc_mdm_log("esoc-mdm driver not present\n");
++		return -EAGAIN;
++	}
++
++	atomic_set(&mdm_drv->n_pon_tries, n_tries);
++	esoc_mdm_log("Num PON tries configured to %u\n", n_tries);
++
++	return 0;
++}
++
++static int esoc_msm_restart_handler(struct notifier_block *nb, unsigned long action, void *data)
++{
++	struct mdm_drv *mdm_drv = container_of(nb, struct mdm_drv, esoc_restart);
++	struct esoc_clink *esoc_clink = mdm_drv->esoc_clink;
++	const struct esoc_clink_ops *const clink_ops = esoc_clink->clink_ops;
++
++	if (action == SYS_RESTART) {
++		if (mdm_dbg_stall_notify(ESOC_PRIMARY_REBOOT))
++			return NOTIFY_OK;
++		mutex_lock(&mdm_drv->poff_lock);
++		if (mdm_drv->mode == PWR_OFF) {
++			esoc_mdm_log("Reboot notifier: mdm already powered-off\n");
++			mutex_unlock(&mdm_drv->poff_lock);
++			return NOTIFY_OK;
++		}
++		esoc_client_link_power_off(esoc_clink, ESOC_HOOK_MDM_DOWN);
++		esoc_mdm_log("Reboot notifier: Notifying esoc of cold reboot\n");
++		dev_dbg(&esoc_clink->dev, "Notifying esoc of cold reboot\n");
++		clink_ops->notify(ESOC_PRIMARY_REBOOT, esoc_clink);
++		mdm_drv->mode = PWR_OFF;
++		mutex_unlock(&mdm_drv->poff_lock);
++	}
++	return NOTIFY_OK;
++}
++static void mdm_handle_clink_evt(enum esoc_evt evt, struct esoc_eng *eng)
++{
++	struct mdm_drv *mdm_drv = to_mdm_drv(eng);
++	bool unexpected_state = false;
++
++	switch (evt) {
++	case ESOC_INVALID_STATE:
++		esoc_mdm_log("ESOC_INVALID_STATE: Calling complete with state: PON_FAIL\n");
++		mdm_drv->pon_state = PON_FAIL;
++		complete(&mdm_drv->pon_done);
++		complete(&mdm_drv->ssr_ready);
++		break;
++	case ESOC_BOOT_STATE:
++		if (mdm_drv->mode == PWR_OFF) {
++			esoc_mdm_log("ESOC_BOOT_STATE: Observed status high from modem.\n");
++			mdm_drv->mode = BOOT;
++		}
++		break;
++	case ESOC_RUN_STATE:
++		esoc_mdm_log("ESOC_RUN_STATE: Calling complete with state: PON_SUCCESS\n");
++		mdm_drv->pon_state = PON_SUCCESS;
++		mdm_drv->mode = RUN;
++		complete(&mdm_drv->pon_done);
++		complete(&mdm_drv->ssr_ready);
++		break;
++	case ESOC_RETRY_PON_EVT:
++		esoc_mdm_log("ESOC_RETRY_PON_EVT: Calling complete with state: PON_RETRY\n");
++		mdm_drv->pon_state = PON_RETRY;
++		complete(&mdm_drv->pon_done);
++		complete(&mdm_drv->ssr_ready);
++		break;
++	case ESOC_UNEXPECTED_RESET:
++		esoc_mdm_log("evt_state: ESOC_UNEXPECTED_RESET\n");
++		unexpected_state = true;
++		fallthrough;
++	case ESOC_ERR_FATAL:
++		if (!unexpected_state)
++			esoc_mdm_log("evt_state: ESOC_ERR_FATAL\n");
++
++		/*
++		 * Ignore all modem errfatals if the status is not up
++		 * or modem in run state.
++		 */
++		if (mdm_drv->mode <= CRASH) {
++			esoc_mdm_log("Modem in crash state or not booted. Ignoring.\n");
++			return;
++		}
++		esoc_mdm_log("Setting crash flag\n");
++		mdm_drv->mode = CRASH;
++		queue_work(mdm_drv->mdm_queue, &mdm_drv->ssr_work);
++		break;
++	case ESOC_REQ_ENG_ON:
++		esoc_mdm_log("evt_state: ESOC_REQ_ENG_ON; Registered a req engine\n");
++		complete(&mdm_drv->req_eng_wait);
++		break;
++	default:
++		break;
++	}
++}
++
++static void mdm_ssr_fn(struct work_struct *work)
++{
++	struct mdm_drv *mdm_drv = container_of(work, struct mdm_drv, ssr_work);
++	struct mdm_ctrl *mdm = get_esoc_clink_data(mdm_drv->esoc_clink);
++	long ret;
++
++	/*
++	 * Drive client crash hooks (e.g. MHI RDDM collection) as soon as we
++	 * know the modem has gone into CRASH, before waiting for any ESOC
++	 * boot-done synchronization.  On upstream boot paths that never send
++	 * ESOC_BOOT_DONE, ssr_ready would otherwise block forever here and the
++	 * BHIe-accessible crash dump would be lost.
++	 */
++	esoc_client_link_power_off(mdm_drv->esoc_clink, ESOC_HOOK_MDM_CRASH);
++
++	/*
++	 * Wait for pon to complete, but with a bounded timeout so we don't
++	 * pin a worker thread forever if the modem crashed before it reached
++	 * PON_SUCCESS (e.g. no userspace BOOT_DONE notifier is running).
++	 */
++	ret = wait_for_completion_timeout(&mdm_drv->ssr_ready,
++					  msecs_to_jiffies(5000));
++	if (!ret || mdm_drv->pon_state != PON_SUCCESS) {
++		esoc_mdm_log("Got errfatal but ignoring as boot failed\n");
++		return;
++	}
++
++	esoc_client_link_mdm_crash(mdm_drv->esoc_clink);
++	mdm_wait_for_status_low(mdm, false);
++	esoc_mdm_log("Starting SSR work\n");
++
++	/*
++	 * If restarting esoc fails, the SSR framework triggers a kernel panic
++	 */
++	esoc_clink_request_ssr(mdm_drv->esoc_clink);
++}
++
++static void esoc_client_link_power_on(struct esoc_clink *esoc_clink, unsigned int flags)
++{
++	int i;
++	struct esoc_client_hook *client_hook;
++
++	dev_dbg(&esoc_clink->dev, "Calling power_on hooks\n");
++	esoc_mdm_log("Calling power_on hooks with flags: 0x%x\n", flags);
++
++	for (i = 0; i < ESOC_MAX_HOOKS; i++) {
++		client_hook = esoc_clink->client_hook[i];
++		if (client_hook && client_hook->esoc_link_power_on)
++			client_hook->esoc_link_power_on(client_hook->priv, flags);
++	}
++}
++
++static void esoc_client_link_power_off(struct esoc_clink *esoc_clink, unsigned int flags)
++{
++	int i;
++	struct esoc_client_hook *client_hook;
++
++	dev_dbg(&esoc_clink->dev, "Calling power_off hooks\n");
++	esoc_mdm_log("Calling power_off hooks with flags: 0x%x\n", flags);
++
++	for (i = 0; i < ESOC_MAX_HOOKS; i++) {
++		client_hook = esoc_clink->client_hook[i];
++		if (client_hook && client_hook->esoc_link_power_off)
++			client_hook->esoc_link_power_off(client_hook->priv, flags);
++	}
++}
++
++static void esoc_client_link_mdm_crash(struct esoc_clink *esoc_clink)
++{
++	int i;
++	struct esoc_client_hook *client_hook;
++
++	dev_dbg(&esoc_clink->dev, "Calling mdm_crash hooks\n");
++	esoc_mdm_log("Calling mdm_crash hooks\n");
++
++	for (i = 0; i < ESOC_MAX_HOOKS; i++) {
++		client_hook = esoc_clink->client_hook[i];
++		if (client_hook && client_hook->esoc_link_mdm_crash)
++			client_hook->esoc_link_mdm_crash(client_hook->priv);
++	}
++}
++
++static unsigned long mdm_rproc_panic(struct rproc *rproc)
++{
++	struct esoc_clink *esoc_clink = container_of(rproc->dev.parent, struct esoc_clink, dev);
++	const struct esoc_clink_ops * const clink_ops = esoc_clink->clink_ops;
++
++	esoc_mdm_log("MDM crashed notification from SSR\n");
++
++	if (mdm_dbg_stall_notify(ESOC_PRIMARY_CRASH))
++		return 0;
++	clink_ops->notify(ESOC_PRIMARY_CRASH, esoc_clink);
++	return 0;
++}
++
++static int mdm_rproc_shutdown(struct rproc *rproc)
++{
++	int ret = 0;
++	struct esoc_clink *esoc_clink = container_of(rproc->dev.parent, struct esoc_clink, dev);
++	struct mdm_drv *mdm_drv = esoc_get_drv_data(esoc_clink);
++	const struct esoc_clink_ops * const clink_ops = esoc_clink->clink_ops;
++	struct mdm_ctrl *mdm = get_esoc_clink_data(mdm_drv->esoc_clink);
++
++	esoc_mdm_log("Shutdown request from SSR\n");
++
++	mutex_lock(&mdm_drv->poff_lock);
++	if (mdm_drv->mode == CRASH || mdm_drv->mode == PEER_CRASH) {
++		esoc_mdm_log("Shutdown in crash mode\n");
++		mdm_wait_for_status_low(mdm, false);
++		if (mdm_dbg_stall_cmd(ESOC_PREPARE_DEBUG)) {
++			/* We want to mask debug command.
++			 * In this case return success
++			 * to move to next stage
++			 */
++			goto unlock;
++		}
++
++		esoc_clink_queue_request(ESOC_REQ_CRASH_SHUTDOWN, esoc_clink);
++		esoc_client_link_power_off(esoc_clink, ESOC_HOOK_MDM_CRASH);
++
++		esoc_mdm_log("Executing the ESOC_PREPARE_DEBUG command\n");
++		ret = clink_ops->cmd_exe(ESOC_PREPARE_DEBUG, esoc_clink);
++		if (ret) {
++			esoc_mdm_log("ESOC_PREPARE_DEBUG command failed\n");
++			dev_err(&esoc_clink->dev, "failed to enter debug\n");
++			goto unlock;
++		}
++		mdm_drv->mode = IN_DEBUG;
++	} else {
++		esoc_mdm_log("Graceful shutdown mode\n");
++		if (mdm_drv->mode == PWR_OFF) {
++			esoc_mdm_log("mdm already powered-off\n");
++			goto unlock;
++		}
++		if (!qcom_sysmon_shutdown_acked(esoc_clink->rproc_sysmon)) {
++			esoc_mdm_log(
++			"Executing the ESOC_FORCE_PWR_OFF command\n");
++			ret = clink_ops->cmd_exe(ESOC_FORCE_PWR_OFF,
++							esoc_clink);
++		} else {
++			if (mdm_dbg_stall_cmd(ESOC_PWR_OFF)) {
++				/* Since power off command is masked
++				 * we return success, and leave the state
++				 * of the command engine as is.
++				 */
++				goto unlock;
++			}
++			dev_dbg(&esoc_clink->dev, "Sending sysmon-shutdown\n");
++			esoc_mdm_log("Executing the ESOC_PWR_OFF command\n");
++			ret = clink_ops->cmd_exe(ESOC_PWR_OFF, esoc_clink);
++		}
++		if (ret) {
++			esoc_mdm_log(
++			"Executing the ESOC_PWR_OFF command failed\n");
++			dev_err(&esoc_clink->dev, "failed to exe power off\n");
++			goto unlock;
++		}
++		esoc_client_link_power_off(esoc_clink, ESOC_HOOK_MDM_DOWN);
++		/* Pull the reset line low to turn off the device */
++		clink_ops->cmd_exe(ESOC_FORCE_PWR_OFF, esoc_clink);
++		mdm_drv->mode = PWR_OFF;
++	}
++	esoc_mdm_log("Shutdown completed\n");
++
++unlock:
++	mutex_unlock(&mdm_drv->poff_lock);
++	return ret;
++}
++
++static void mdm_subsys_retry_powerup_cleanup(struct esoc_clink *esoc_clink, unsigned int poff_flags)
++{
++	struct mdm_ctrl *mdm = get_esoc_clink_data(esoc_clink);
++	struct mdm_drv *mdm_drv = esoc_get_drv_data(esoc_clink);
++
++	esoc_mdm_log("Doing cleanup\n");
++
++	esoc_client_link_power_off(esoc_clink, poff_flags);
++	mdm_disable_irqs(mdm);
++	mdm_drv->pon_state = PON_INIT;
++	mdm_drv->mode = PWR_OFF;
++	reinit_completion(&mdm_drv->pon_done);
++	reinit_completion(&mdm_drv->ssr_ready);
++	reinit_completion(&mdm_drv->req_eng_wait);
++}
++
++/* Returns 0 to proceed towards another retry, or an error code to quit */
++static int mdm_handle_boot_fail(struct esoc_clink *esoc_clink, u8 *pon_trial)
++{
++	struct mdm_ctrl *mdm = get_esoc_clink_data(esoc_clink);
++	struct mdm_drv *mdm_drv = esoc_get_drv_data(esoc_clink);
++
++	if (*pon_trial == atomic_read(&mdm_drv->n_pon_tries)) {
++		esoc_mdm_log("Reached max. number of boot trials\n");
++		atomic_set(&mdm_drv->boot_fail_action, BOOT_FAIL_ACTION_PANIC);
++	}
++
++	switch (atomic_read(&mdm_drv->boot_fail_action)) {
++	case BOOT_FAIL_ACTION_RETRY:
++		mdm_subsys_retry_powerup_cleanup(esoc_clink, 0);
++		esoc_mdm_log("Request to retry a warm reset\n");
++		(*pon_trial)++;
++		break;
++	/*
++	 * Issue a shutdown here and rerun the powerup again.
++	 * This way it becomes a cold reset. Else, we end up
++	 * issuing a cold reset & a warm reset back to back.
++	 */
++	case BOOT_FAIL_ACTION_COLD_RESET:
++		mdm_subsys_retry_powerup_cleanup(esoc_clink, ESOC_HOOK_MDM_DOWN);
++		esoc_mdm_log("Doing cold reset by power-down and warm reset\n");
++		(*pon_trial)++;
++		mdm_power_down(mdm);
++		break;
++	case BOOT_FAIL_ACTION_S3_RESET:
++		mdm_subsys_retry_powerup_cleanup(esoc_clink, ESOC_HOOK_MDM_DOWN);
++		esoc_mdm_log("Doing an S3 reset\n");
++		(*pon_trial)++;
++		mdm_power_down(mdm);
++		msleep(S3_RESET_DELAY_MS);
++		break;
++	case BOOT_FAIL_ACTION_PANIC:
++		esoc_mdm_log("Calling panic!!\n");
++		panic("Panic requested on external modem boot failure\n");
++		break;
++	case BOOT_FAIL_ACTION_NOP:
++		esoc_mdm_log("Leaving the modem in its curent state\n");
++		mdm_drv->mode = PWR_OFF;
++		return -EIO;
++	case BOOT_FAIL_ACTION_SHUTDOWN:
++	default:
++		mdm_subsys_retry_powerup_cleanup(esoc_clink, ESOC_HOOK_MDM_DOWN);
++		esoc_mdm_log("Shutdown the modem and quit\n");
++		mdm_power_down(mdm);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int mdm_rproc_powerup(struct rproc *rproc)
++{
++	int ret;
++	struct esoc_clink *esoc_clink = container_of(rproc->dev.parent, struct esoc_clink, dev);
++	struct mdm_drv *mdm_drv = esoc_get_drv_data(esoc_clink);
++	const struct esoc_clink_ops * const clink_ops = esoc_clink->clink_ops;
++	int timeout = PON_DONE_TIMEOUT_MS;
++	u8 pon_trial = 0;
++
++	esoc_mdm_log("Powerup request from SSR\n");
++
++	do {
++		esoc_mdm_log("Boot trial: %d\n", pon_trial);
++		if (!esoc_clink->auto_boot &&
++			!esoc_req_eng_enabled(esoc_clink)) {
++			esoc_mdm_log("Wait for req eng registration\n");
++			dev_dbg(&esoc_clink->dev, "Wait for req eng registration\n");
++			wait_for_completion(&mdm_drv->req_eng_wait);
++		}
++		esoc_mdm_log("Req eng available\n");
++		if (mdm_drv->mode == PWR_OFF) {
++			esoc_mdm_log("In normal power-on mode\n");
++			if (mdm_dbg_stall_cmd(ESOC_PWR_ON))
++				return -EBUSY;
++			/*
++			 * Clear the hard-reset flag so a graceful
++			 * restart after a clean shutdown uses the
++			 * normal warm reset.
++			 */
++			((struct mdm_ctrl *)get_esoc_clink_data(esoc_clink))->needs_hard_reset = false;
++			esoc_mdm_log("Executing the ESOC_PWR_ON command\n");
++			ret = clink_ops->cmd_exe(ESOC_PWR_ON, esoc_clink);
++			if (ret) {
++				esoc_mdm_log("ESOC_PWR_ON command failed\n");
++				dev_err(&esoc_clink->dev, "pwr on fail\n");
++				return ret;
++			}
++			esoc_client_link_power_on(esoc_clink, 0);
++		} else if (mdm_drv->mode == IN_DEBUG) {
++			esoc_mdm_log("In SSR power-on mode\n");
++			esoc_mdm_log("Executing the ESOC_EXIT_DEBUG command\n");
++			ret = clink_ops->cmd_exe(ESOC_EXIT_DEBUG, esoc_clink);
++			if (ret) {
++				esoc_mdm_log(
++				"ESOC_EXIT_DEBUG command failed\n");
++				dev_err(&esoc_clink->dev, "cannot exit debug mode\n");
++				return ret;
++			}
++			mdm_drv->mode = PWR_OFF;
++			esoc_mdm_log("Executing the ESOC_PWR_ON command\n");
++			ret = clink_ops->cmd_exe(ESOC_PWR_ON, esoc_clink);
++			if (ret) {
++				dev_err(&esoc_clink->dev, "pwr on fail\n");
++				return ret;
++			}
++			esoc_client_link_power_on(esoc_clink, ESOC_HOOK_MDM_CRASH);
++		}
++
++		/*
++		 * In autoboot case, it is possible that we can forever wait for
++		 * boot completion, when esoc fails to boot. This is because
++		 * there is no helper application which can alert esoc driver
++		 * about boot failure. Prevent going to wait forever in such
++		 * case.
++		 */
++		if (esoc_clink->auto_boot)
++			timeout = 10 * HZ;
++		esoc_mdm_log("Modem turned-on. Waiting for pon_done notification..\n");
++		ret = wait_for_completion_timeout(&mdm_drv->pon_done, msecs_to_jiffies(timeout));
++		if (mdm_drv->pon_state == PON_FAIL || ret <= 0) {
++			dev_err(&esoc_clink->dev, "booting failed\n");
++			esoc_mdm_log("booting failed\n");
++			ret = mdm_handle_boot_fail(esoc_clink, &pon_trial);
++			if (ret)
++				return ret;
++		} else if (mdm_drv->pon_state == PON_RETRY) {
++			esoc_mdm_log("Boot failed. Doing cleanup and attempting to retry\n");
++			mdm_subsys_retry_powerup_cleanup(esoc_clink, 0);
++		} else if (mdm_drv->pon_state == PON_SUCCESS) {
++			break;
++		}
++	} while (pon_trial <= atomic_read(&mdm_drv->n_pon_tries));
++
++	return 0;
++}
++
++static int mdm_rproc_elf_load_segments(struct rproc *rproc, const struct firmware *fw)
++{
++	return 0;
++}
++
++static int mdm_register_ssr(struct esoc_clink *esoc_clink)
++{
++
++	esoc_clink->ops.stop = mdm_rproc_shutdown;
++	esoc_clink->ops.start = mdm_rproc_powerup;
++	esoc_clink->ops.panic = mdm_rproc_panic;
++	esoc_clink->ops.load = mdm_rproc_elf_load_segments;
++	return esoc_clink_register_rproc(esoc_clink);
++}
++
++static int esoc_ssr_probe(struct esoc_clink *esoc_clink, struct esoc_drv *drv)
++{
++	int ret;
++	struct mdm_drv *mdm_drv;
++	struct mdm_drv_data *data;
++	struct esoc_eng *esoc_eng;
++
++	data = esoc_device_get_match_data(&esoc_clink->dev);
++	if (IS_ERR(data)) {
++		dev_err(&esoc_clink->dev, "esoc match data failed: %ld\n", PTR_ERR(data));
++		return PTR_ERR(data);
++	}
++
++	esoc_clink->fw = data->fw;
++
++	mdm_drv = devm_kzalloc(&esoc_clink->dev, sizeof(*mdm_drv), GFP_KERNEL);
++	if (IS_ERR_OR_NULL(mdm_drv))
++		return PTR_ERR(mdm_drv);
++	esoc_eng = &mdm_drv->cmd_eng;
++	esoc_eng->handle_clink_evt = mdm_handle_clink_evt;
++	ret = esoc_clink_register_cmd_eng(esoc_clink, esoc_eng);
++	if (ret) {
++		dev_err(&esoc_clink->dev, "failed to register cmd engine\n");
++		return ret;
++	}
++	mutex_init(&mdm_drv->poff_lock);
++	ret = mdm_register_ssr(esoc_clink);
++	if (ret)
++		goto ssr_err;
++	mdm_drv->mdm_queue = alloc_workqueue("mdm_drv_queue", 0, 0);
++	if (!mdm_drv->mdm_queue) {
++		dev_err(&esoc_clink->dev, "could not create mdm_queue\n");
++		goto queue_err;
++	}
++	esoc_set_drv_data(esoc_clink, mdm_drv);
++	init_completion(&mdm_drv->pon_done);
++	init_completion(&mdm_drv->ssr_ready);
++	init_completion(&mdm_drv->req_eng_wait);
++	INIT_WORK(&mdm_drv->ssr_work, mdm_ssr_fn);
++	mdm_drv->esoc_clink = esoc_clink;
++	mdm_drv->mode = PWR_OFF;
++	mdm_drv->pon_state = PON_INIT;
++	atomic_set(&mdm_drv->boot_fail_action, BOOT_FAIL_ACTION_DEF);
++	atomic_set(&mdm_drv->n_pon_tries, ESOC_DEF_PON_REQ);
++	mdm_drv->esoc_restart.notifier_call = esoc_msm_restart_handler;
++	ret = register_reboot_notifier(&mdm_drv->esoc_restart);
++	if (ret)
++		dev_err(&esoc_clink->dev, "register for reboot failed\n");
++
++	ret = register_dbg_req_eng(esoc_clink);
++	if (ret)
++		dev_err(&esoc_clink->dev, "Failed to register esoc dbg req eng\n");
++	return 0;
++queue_err:
++	esoc_clink_unregister_rproc(esoc_clink);
++ssr_err:
++	esoc_clink_unregister_cmd_eng(esoc_clink, esoc_eng);
++	return ret;
++}
++
++static int esoc_ssr_remove(struct esoc_clink *esoc_clink, struct esoc_drv *drv)
++{
++	int ret;
++	struct mdm_drv *mdm_drv;
++
++	mdm_drv = esoc_get_drv_data(esoc_clink);
++	esoc_set_drv_data(esoc_clink, NULL);
++	esoc_clink_unregister_cmd_eng(esoc_clink, &mdm_drv->cmd_eng);
++	esoc_clink_unregister_rproc(esoc_clink);
++	if (mdm_drv->mdm_queue)
++		destroy_workqueue(mdm_drv->mdm_queue);
++	ret = unregister_reboot_notifier(&mdm_drv->esoc_restart);
++	if (ret)
++		dev_err(&esoc_clink->dev, "unregister reboot notifier failed\n");
++
++	unregister_dbg_req_eng(esoc_clink);
++
++	return 0;
++}
++
++struct mdm_drv_data mdm_9x55 = {
++	.fw = "mdm9x55/sbl1.mbn",
++};
++
++struct mdm_drv_data sdx_50m = {
++	.fw = "sdx50m/sbl1.mbn",
++};
++
++struct mdm_drv_data sdx_55m = {
++	.fw = "qcom/sdx55m/sbl1.mbn",
++};
++
++struct mdm_drv_data sdx_lemur = {
++	.fw = "sdx65m/xbl.elf",
++};
++
++struct mdm_drv_data sdx_pinn = {
++	.fw = "sdx75m/xbl_s.melf",
++};
++
++struct mdm_drv_data sdx_baagha = {
++	.fw = "sdx35m/xbl.elf",
++};
++
++struct esoc_compat compat_table[] = {
++	{
++		.name = "MDM9x55",
++		.data = &mdm_9x55,
++	},
++	{
++		.name = "SDX50M",
++		.data = &sdx_50m,
++	},
++	{
++		.name = "SDX55M",
++		.data = &sdx_55m,
++	},
++	{
++		.name = "SDXLEMUR",
++		.data = &sdx_lemur,
++	},
++	{
++		.name = "SDXPINN",
++		.data = &sdx_pinn,
++	},
++	{
++		.name = "SDXBAAGHA",
++		.data = &sdx_baagha,
++	},
++};
++
++static struct esoc_drv esoc_ssr_drv = {
++	.owner = THIS_MODULE,
++	.probe = esoc_ssr_probe,
++	.remove = esoc_ssr_remove,
++	.compat_table = compat_table,
++	.compat_entries = ARRAY_SIZE(compat_table),
++	.driver = {
++		.name = "mdm-4x",
++	},
++};
++
++int mdm_drv_init(void)
++{
++	int ret;
++
++	ret = mdm_dbg_eng_init();
++	if (ret) {
++		debug_init_done = false;
++		pr_err("esoc dbg engine failure\n");
++	} else {
++		debug_init_done = true;
++		pr_debug("esoc dbg engine initialized\n");
++	}
++
++	ret = esoc_driver_register(&esoc_ssr_drv);
++	if (ret)
++		pr_err("esoc ssr driver registration failed\n");
++
++	return ret;
++}
++
++void mdm_drv_exit(void)
++{
++	esoc_driver_unregister(&esoc_ssr_drv);
++	mdm_dbg_eng_exit();
++}
++
++EXPORT_SYMBOL(mdm_drv_init);
++EXPORT_SYMBOL(mdm_drv_exit);
++EXPORT_SYMBOL(esoc_set_boot_fail_action);
++EXPORT_SYMBOL(esoc_set_n_pon_tries);
++
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/remoteproc/esoc-mdm-pon.c
+@@ -0,0 +1,343 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2014-2015, 2017-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include "esoc-mdm.h"
++#include <linux/regulator/consumer.h>
++#include <linux/gpio/consumer.h>
++#include <linux/input/qpnp-power-on.h>
++#include <linux/of_gpio.h>
++
++/* This function can be called from atomic context. */
++static int mdm9x55_toggle_soft_reset(struct mdm_ctrl *mdm, bool atomic)
++{
++	int soft_reset_direction_assert = 0, soft_reset_direction_de_assert = 1;
++	uint32_t reset_time_us = mdm->reset_time_ms * 1000;
++
++	if (mdm->soft_reset_inverted) {
++		soft_reset_direction_assert = 1;
++		soft_reset_direction_de_assert = 0;
++	}
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction_assert);
++	/*
++	 * Allow PS hold assert to be detected
++	 */
++	if (!atomic)
++		usleep_range(reset_time_us, reset_time_us + 100000);
++	else
++		/*
++		 * The flow goes through this path as a part of the
++		 * panic handler, which has to executed atomically.
++		 */
++		mdelay(mdm->reset_time_ms);
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction_de_assert);
++	return 0;
++}
++
++/* This function can be called from atomic context. */
++static int sdx50m_toggle_soft_reset(struct mdm_ctrl *mdm, bool atomic)
++{
++	int soft_reset_direction_assert = 0, soft_reset_direction_de_assert = 1;
++
++	if (mdm->soft_reset_inverted) {
++		soft_reset_direction_assert = 1;
++		soft_reset_direction_de_assert = 0;
++	}
++
++	esoc_mdm_log("RESET GPIO value (before doing a reset): %d\n",
++		     gpio_get_value(MDM_GPIO(mdm, AP2MDM_SOFT_RESET)));
++	esoc_mdm_log("Setting AP2MDM_SOFT_RESET = %d\n", soft_reset_direction_assert);
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction_assert);
++	/*
++	 * Allow PS hold assert to be detected
++	 */
++	if (!atomic)
++		usleep_range(80000, 180000);
++	else
++		/*
++		 * The flow goes through this path as a part of the
++		 * panic handler, which has to executed atomically.
++		 */
++		mdelay(100);
++
++	esoc_mdm_log("Setting AP2MDM_SOFT_RESET = %d\n", soft_reset_direction_de_assert);
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction_de_assert);
++	return 0;
++}
++
++/* This function can be called from atomic context. */
++/*
++ * Whether the modem has been reset once already this AP boot. The first reset
++ * happens with the PCIe link still up from enumeration; every later one starts
++ * from a link that has gone down, which needs the harder reset below.
++ */
++static bool powered_on_once;
++
++static int sdx55m_toggle_soft_reset(struct mdm_ctrl *mdm, bool atomic)
++{
++	int rc;
++
++	/*
++	 * PON_POWER_OFF_SHUTDOWN must never be used here: it powers the modem
++	 * PMIC down for good, and the SW_RST_GO write of a follow-up reset is
++	 * then a no-op because the PON block is no longer running.  The modem
++	 * stays dark and SSR can only be escaped by rebooting the AP.
++	 *
++	 * That is not a reason to avoid PON_POWER_OFF_HARD_RESET on its own,
++	 * though.  A warm reset restarts the modem's compute side but leaves
++	 * the PMIC peripherals alone, which is enough for the very first
++	 * power-on -- there the PCIe link is already up from enumeration and
++	 * the endpoint answers immediately.  Restarting a modem that has
++	 * already been running is a different matter: the link goes down and
++	 * the endpoint never comes back, no matter how long we wait or how
++	 * often PERST# is pulsed.  Reset the PMIC peripherals too in that case
++	 * so the endpoint comes up from cold like it does at boot.
++	 */
++	if (powered_on_once) {
++		esoc_mdm_log("Doing a Hard reset using SPMI\n");
++		pr_info("esoc-mdm: doing hard reset using SPMI (restart)\n");
++		rc = qpnp_pon_modem_pwr_off(PON_POWER_OFF_HARD_RESET);
++		if (rc) {
++			dev_err(mdm->dev, "SPMI hard reset failed: %d\n", rc);
++			esoc_mdm_log("SPMI hard reset failed\n");
++			return rc;
++		}
++		esoc_mdm_log("Hard reset done using SPMI\n");
++		pr_info("esoc-mdm: hard reset done using SPMI\n");
++
++		return 0;
++	}
++
++	esoc_mdm_log("Doing a Warm reset using SPMI\n");
++	pr_info("esoc-mdm: doing warm reset using SPMI (first power-on)\n");
++	rc = qpnp_pon_modem_pwr_off(PON_POWER_OFF_WARM_RESET);
++	if (rc) {
++		dev_err(mdm->dev, "SPMI warm reset failed: %d\n", rc);
++		pr_err("esoc-mdm: SPMI warm reset failed: %d\n", rc);
++		esoc_mdm_log("SPMI warm reset failed\n");
++		return rc;
++	}
++	esoc_mdm_log("Warm reset done using SPMI\n");
++	pr_info("esoc-mdm: warm reset done using SPMI\n");
++
++	powered_on_once = true;
++
++	return 0;
++}
++
++static int mdm4x_do_first_power_on(struct mdm_ctrl *mdm)
++{
++	int i, rc;
++	int pblrdy;
++	struct device *dev = mdm->dev;
++
++	esoc_mdm_log("Powering on modem for the first time\n");
++	dev_dbg(dev, "Powering on modem for the first time\n");
++	if (mdm->esoc->auto_boot)
++		return 0;
++
++	/* turn on regulators on AP side */
++	for (i = 0; i < mdm->reg_cnt; ++i) {
++		regulator_set_voltage(mdm->regs[i].reg, mdm->regs[i].uV, INT_MAX);
++		regulator_set_load(mdm->regs[i].reg, mdm->regs[i].uA);
++		rc = regulator_enable(mdm->regs[i].reg);
++		if (rc) {
++			dev_err(mdm->dev, "Failed to enable regulator %d (rc:%d)\n", i, rc);
++			esoc_mdm_log("Failed to enable regulator %d (rc:%d)\n", i, rc);
++			return rc;
++		}
++	}
++
++	mdm_toggle_soft_reset(mdm, false);
++	/* Add a delay to allow PON sequence to complete*/
++	msleep(150);
++	esoc_mdm_log("Setting AP2MDM_STATUS = 1\n");
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_STATUS), 1);
++	if (gpio_is_valid(MDM_GPIO(mdm, MDM2AP_PBLRDY))) {
++		for (i = 0; i  < MDM_PBLRDY_CNT; i++) {
++			pblrdy = gpio_get_value(MDM_GPIO(mdm, MDM2AP_PBLRDY));
++			if (pblrdy)
++				break;
++			usleep_range(5000, 6000);
++		}
++		dev_dbg(dev, "pblrdy i:%d\n", i);
++		msleep(200);
++	}
++	/*
++	 * No PBLRDY gpio associated with this modem
++	 * Send request for image. Let userspace confirm establishment of
++	 * link to external modem.
++	 */
++	else {
++		esoc_mdm_log("Queueing the request: ESOC_REQ_IMG\n");
++		pr_info("esoc-mdm: queue REQ_IMG ap2mdm_status=%d ap2mdm_errfatal=%d mdm2ap_status=%d mdm2ap_errfatal=%d\n",
++			gpio_get_value(MDM_GPIO(mdm, AP2MDM_STATUS)),
++			gpio_get_value(MDM_GPIO(mdm, AP2MDM_ERRFATAL)),
++			gpio_get_value(MDM_GPIO(mdm, MDM2AP_STATUS)),
++			gpio_get_value(MDM_GPIO(mdm, MDM2AP_ERRFATAL)));
++		esoc_clink_queue_request(ESOC_REQ_IMG, mdm->esoc);
++	}
++
++	return 0;
++}
++
++static int mdm9x55_power_down(struct mdm_ctrl *mdm)
++{
++	struct device *dev = mdm->dev;
++	int soft_reset_direction_assert = 0, soft_reset_direction_de_assert = 1;
++
++	if (mdm->soft_reset_inverted) {
++		soft_reset_direction_assert = 1;
++		soft_reset_direction_de_assert = 0;
++	}
++	/* Assert the soft reset line whether mdm2ap_status went low or not */
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction_assert);
++	dev_dbg(dev, "Doing a hard reset\n");
++	/*
++	 * Currently, there is a debounce timer on the charm PMIC. It is
++	 * necessary to hold the PMIC RESET low for 406ms
++	 * for the reset to fully take place. Sleep here to ensure the
++	 * reset has occurred before the function exits.
++	 */
++	msleep(406);
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction_de_assert);
++	return 0;
++}
++
++static int sdx50m_power_down(struct mdm_ctrl *mdm)
++{
++	struct device *dev = mdm->dev;
++	int soft_reset_direction = mdm->soft_reset_inverted ? 1 : 0;
++	/* Assert the soft reset line whether mdm2ap_status went low or not */
++	esoc_mdm_log("Setting AP2MDM_SOFT_RESET = %d\n", soft_reset_direction);
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction);
++	dev_dbg(dev, "Doing a hard reset\n");
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), soft_reset_direction);
++	/*
++	 * Currently, there is a debounce timer on the charm PMIC. It is
++	 * necessary to hold the PMIC RESET low for 406ms
++	 * for the reset to fully take place. Sleep here to ensure the
++	 * reset has occurred before the function exits.
++	 */
++	msleep(300);
++	return 0;
++}
++
++static int sdx55m_power_down(struct mdm_ctrl *mdm)
++{
++	esoc_mdm_log("Performing warm reset as cold reset is not supported\n");
++	return sdx55m_toggle_soft_reset(mdm, false);
++}
++
++static void mdm9x55_cold_reset(struct mdm_ctrl *mdm)
++{
++	dev_dbg(mdm->dev, "Triggering mdm cold reset");
++
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), !!mdm->soft_reset_inverted);
++
++	/*
++	 * The function is executed as a part of the atomic reboot handler.
++	 * Hence, go with a busy loop instead of sleep.
++	 */
++	mdelay(334);
++
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), !mdm->soft_reset_inverted);
++}
++
++static void sdx50m_cold_reset(struct mdm_ctrl *mdm)
++{
++	dev_dbg(mdm->dev, "Triggering mdm cold reset");
++	esoc_mdm_log("Setting AP2MDM_SOFT_RESET = %d\n", !!mdm->soft_reset_inverted);
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), !!mdm->soft_reset_inverted);
++
++	/*
++	 * The function is executed as a part of the atomic reboot handler.
++	 * Hence, go with a busy loop instead of sleep.
++	 */
++	mdelay(600);
++
++	esoc_mdm_log("Setting AP2MDM_SOFT_RESET = %d\n", !!mdm->soft_reset_inverted);
++	gpio_direction_output(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), !mdm->soft_reset_inverted);
++}
++
++static int mdm9x55_pon_dt_init(struct mdm_ctrl *mdm)
++{
++	int val;
++	struct device_node *node = mdm->dev->of_node;
++	enum of_gpio_flags flags = OF_GPIO_ACTIVE_LOW;
++
++
++	val = of_property_read_u32(node, "qcom,reset-time-ms", &mdm->reset_time_ms);
++	if (val)
++		mdm->reset_time_ms = DEF_MDM9X55_RESET_TIME;
++
++	val = of_get_named_gpio_flags(node, "qcom,ap2mdm-soft-reset-gpio", 0, &flags);
++	if (val >= 0) {
++		MDM_GPIO(mdm, AP2MDM_SOFT_RESET) = val;
++		if (flags & OF_GPIO_ACTIVE_LOW)
++			mdm->soft_reset_inverted = 1;
++		return 0;
++	} else
++		return -EIO;
++}
++
++static int mdm4x_pon_dt_init(struct mdm_ctrl *mdm)
++{
++	int val;
++	struct device_node *node = mdm->dev->of_node;
++	enum of_gpio_flags flags = OF_GPIO_ACTIVE_LOW;
++
++	val = of_get_named_gpio_flags(node, "qcom,ap2mdm-soft-reset-gpio", 0, &flags);
++	if (val >= 0) {
++		MDM_GPIO(mdm, AP2MDM_SOFT_RESET) = val;
++		if (flags & OF_GPIO_ACTIVE_LOW)
++			mdm->soft_reset_inverted = 1;
++		return 0;
++	} else
++		return -EIO;
++}
++
++static int mdm4x_pon_setup(struct mdm_ctrl *mdm)
++{
++	struct device *dev = mdm->dev;
++
++	if (gpio_is_valid(MDM_GPIO(mdm, AP2MDM_SOFT_RESET))) {
++		if (gpio_request(MDM_GPIO(mdm, AP2MDM_SOFT_RESET), "AP2MDM_SOFT_RESET")) {
++			dev_err(dev, "Cannot config AP2MDM_SOFT_RESET gpio\n");
++			return -EIO;
++		}
++	}
++	return 0;
++}
++
++struct mdm_pon_ops mdm9x55_pon_ops = {
++	.pon = mdm4x_do_first_power_on,
++	.soft_reset = mdm9x55_toggle_soft_reset,
++	.poff_force = mdm9x55_power_down,
++	.cold_reset = mdm9x55_cold_reset,
++	.dt_init = mdm9x55_pon_dt_init,
++	.setup = mdm4x_pon_setup,
++};
++
++struct mdm_pon_ops sdx50m_pon_ops = {
++	.pon = mdm4x_do_first_power_on,
++	.soft_reset = sdx50m_toggle_soft_reset,
++	.poff_force = sdx50m_power_down,
++	.cold_reset = sdx50m_cold_reset,
++	.dt_init = mdm4x_pon_dt_init,
++	.setup = mdm4x_pon_setup,
++};
++
++struct mdm_pon_ops sdx55m_pon_ops = {
++	.pon = mdm4x_do_first_power_on,
++	.soft_reset = sdx55m_toggle_soft_reset,
++	.poff_force = sdx55m_power_down,
++};
++
++EXPORT_SYMBOL(mdm9x55_pon_ops);
++EXPORT_SYMBOL(sdx50m_pon_ops);
++EXPORT_SYMBOL(sdx55m_pon_ops);
++
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/remoteproc/esoc-mdm.h
+@@ -0,0 +1,181 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2014-2015, 2017-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#ifndef __ESOC_MDM_H__
++#define __ESOC_MDM_H__
++
++#include <linux/delay.h>
++#include <linux/gpio.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/of_address.h>
++#include <linux/of_gpio.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/sched.h>
++#include "esoc.h"
++
++#define MDM_PBLRDY_CNT			20
++#define INVALID_GPIO			(-1)
++#define MDM_GPIO(mdm, i)		(mdm->gpios[i])
++#define MDM9x55_LABEL			"MDM9x55"
++#define MDM9x55_PCIE			"PCIe"
++#define SDX50M_LABEL			"SDX50M"
++#define SDX50M_PCIE			"PCIe"
++#define SDX55M_LABEL			"SDX55M"
++/* What the other subsystems know the external modem as, on the wire. */
++#define ESOC0_LABEL			"esoc0"
++#define SDX55M_PCIE			"PCIe"
++#define LEMUR_LABEL			"SDXLEMUR"
++#define LEMUR_PCIE			"PCIe"
++#define PINN_LABEL			"SDXPINN"
++#define PINN_PCIE			"PCIe"
++#define BAAGHA_LABEL			"SDXBAAGHA"
++#define BAAGHA_PCIE			"PCIe"
++#define MDM2AP_STATUS_TIMEOUT_MS	120000L
++#define MDM_MODEM_TIMEOUT		3000
++#define DEF_RAMDUMP_TIMEOUT		120000
++#define DEF_RAMDUMP_DELAY		2000
++#define DEF_SHUTDOWN_TIMEOUT		10000
++#define DEF_MDM9X55_RESET_TIME		203
++#define RD_BUF_SIZE			100
++#define SFR_MAX_RETRIES			10
++#define SFR_RETRY_INTERVAL		1000
++#define MDM_DBG_OFFSET			0x934
++#define MDM_DBG_MODE			0x53444247
++#define MDM_CTI_NAME			"coresight-cti-rpm-cpu0"
++#define MDM_CTI_TRIG			0
++#define MDM_CTI_CH			0
++
++enum mdm_gpio {
++	AP2MDM_WAKEUP = 0,
++	AP2MDM_STATUS,
++	AP2MDM_SOFT_RESET,
++	AP2MDM_VDD_MIN,
++	AP2MDM_CHNLRDY,
++	AP2MDM_ERRFATAL,
++	AP2MDM_VDDMIN,
++	AP2MDM_PMIC_PWR_EN,
++	MDM2AP_WAKEUP,
++	MDM2AP_ERRFATAL,
++	MDM2AP_PBLRDY,
++	MDM2AP_STATUS,
++	MDM2AP_VDDMIN,
++	MDM_LINK_DETECT,
++	NUM_GPIOS,
++};
++
++struct reg_info {
++	struct regulator *reg;
++	int uV;
++	int uA;
++};
++
++struct mdm_pon_ops;
++
++struct mdm_ctrl {
++	unsigned int gpios[NUM_GPIOS];
++	spinlock_t status_lock;
++	struct workqueue_struct *mdm_queue;
++	struct delayed_work mdm2ap_status_check_work;
++	struct work_struct mdm_status_work;
++	struct work_struct restart_reason_work;
++	struct completion debug_done;
++	struct device *dev;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *gpio_state_booting;
++	struct pinctrl_state *gpio_state_running;
++	struct pinctrl_state *gpio_state_active;
++	struct pinctrl_state *gpio_state_suspend;
++	int mdm2ap_status_valid_old_config;
++	int soft_reset_inverted;
++	int errfatal_irq;
++	int status_irq;
++	int pblrdy_irq;
++	struct reg_info *regs;
++	int reg_cnt;
++	int debug;
++	int init;
++	bool debug_fail;
++	unsigned int dump_timeout_ms;
++	unsigned int ramdump_delay_ms;
++	unsigned int shutdown_timeout_ms;
++	unsigned int reset_time_ms;
++	struct esoc_clink *esoc;
++	bool get_restart_reason;
++	unsigned long irq_mask;
++	bool ready;
++	bool dual_interface;
++	u32 status;
++	void __iomem *dbg_addr;
++	bool dbg_mode;
++	struct coresight_cti *cti;
++	int trig_cnt;
++	const struct mdm_pon_ops *pon_ops;
++	bool skip_restart_for_mdm_crash;
++	bool needs_hard_reset;
++};
++
++struct mdm_pon_ops {
++	int (*pon)(struct mdm_ctrl *mdm);
++	int (*soft_reset)(struct mdm_ctrl *mdm, bool atomic);
++	int (*poff_force)(struct mdm_ctrl *mdm);
++	int (*poff_cleanup)(struct mdm_ctrl *mdm);
++	void (*cold_reset)(struct mdm_ctrl *mdm);
++	int (*dt_init)(struct mdm_ctrl *mdm);
++	int (*setup)(struct mdm_ctrl *mdm);
++};
++
++struct mdm_ops {
++	struct esoc_clink_ops *clink_ops;
++	struct mdm_pon_ops *pon_ops;
++	int (*config_hw)(struct mdm_ctrl *mdm, const struct mdm_ops *ops,
++			 struct platform_device *pdev);
++};
++
++void mdm_disable_irqs(struct mdm_ctrl *mdm);
++void mdm_wait_for_status_low(struct mdm_ctrl *mdm, bool atomic);
++
++static inline int mdm_toggle_soft_reset(struct mdm_ctrl *mdm, bool atomic)
++{
++	if (mdm->pon_ops->soft_reset)
++		return mdm->pon_ops->soft_reset(mdm, atomic);
++	return -ENOENT;
++}
++static inline int mdm_do_first_power_on(struct mdm_ctrl *mdm)
++{
++	if (mdm->pon_ops->pon)
++		return mdm->pon_ops->pon(mdm);
++	return -ENOENT;
++}
++static inline int mdm_power_down(struct mdm_ctrl *mdm)
++{
++	if (mdm->pon_ops->poff_force)
++		return mdm->pon_ops->poff_force(mdm);
++	return -ENOENT;
++}
++static inline void mdm_cold_reset(struct mdm_ctrl *mdm)
++{
++	if (mdm->pon_ops->cold_reset)
++		mdm->pon_ops->cold_reset(mdm);
++}
++static inline int mdm_pon_dt_init(struct mdm_ctrl *mdm)
++{
++	if (mdm->pon_ops->dt_init)
++		return mdm->pon_ops->dt_init(mdm);
++	return -ENOENT;
++}
++static inline int mdm_pon_setup(struct mdm_ctrl *mdm)
++{
++	if (mdm->pon_ops->setup)
++		return mdm->pon_ops->setup(mdm);
++	return -ENOENT;
++}
++
++extern struct mdm_pon_ops mdm9x55_pon_ops;
++extern struct mdm_pon_ops sdx50m_pon_ops;
++extern struct mdm_pon_ops sdx55m_pon_ops;
++#endif
+--- /dev/null
++++ b/drivers/remoteproc/esoc.h
+@@ -0,0 +1,202 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2013-2015, 2017-2018, 2020-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++#ifndef __ESOC_H__
++#define __ESOC_H__
++
++#include <linux/cdev.h>
++#include <linux/completion.h>
++#include <linux/esoc_ctrl.h>
++#include <linux/esoc_client.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/remoteproc.h>
++#include <linux/ipc_logging.h>
++#include <linux/printk.h>
++
++#include "qcom_common.h"
++
++#define ESOC_MDM_IPC_PAGES	10
++
++extern void *ipc_log;
++
++#if IS_ENABLED(CONFIG_IPC_LOGGING)
++#define esoc_mdm_log(__msg, ...) \
++	ipc_log_string(ipc_log, "[%s]: " __msg, __func__, ##__VA_ARGS__)
++#else
++#define esoc_mdm_log(__msg, ...) \
++	pr_info("esoc-mdm: [%s]: " __msg, __func__, ##__VA_ARGS__)
++#endif
++
++#define ESOC_DEV_MAX		4
++#define ESOC_NAME_LEN		20
++#define ESOC_LINK_LEN		20
++
++struct esoc_clink;
++/**
++ * struct esoc_eng: Engine of the esoc control link
++ * @handle_clink_req: handle incoming esoc requests.
++ * @handle_clink_evt: handle for esoc events.
++ * @esoc_clink: pointer to esoc control link.
++ */
++struct esoc_eng {
++	void (*handle_clink_req)(enum esoc_req req, struct esoc_eng *eng);
++	void (*handle_clink_evt)(enum esoc_evt evt, struct esoc_eng *eng);
++	struct esoc_clink *esoc_clink;
++};
++
++/**
++ * struct esoc_clink: Representation of external esoc device
++ * @name: Name of the external esoc.
++ * @link_name: name of the physical link.
++ * @link_info: additional info about the physical link.
++ * @parent: parent device.
++ * @dev: device for userspace interface.
++ * @pdev: platform device to interface with SSR driver.
++ * @id: id of the external device.
++ * @owner: owner of the device.
++ * @clink_ops: control operations for the control link
++ * @req_eng: handle for request engine.
++ * @cmd_eng: handle for command engine.
++ * @clink_data: private data of esoc control link.
++ * @compat_data: compat data of esoc driver.
++ * @rproc: pointer to the esoc remoteproc struct
++ * @ops: esoc driver remoteproc ops
++ * @subsys_desc: descriptor for subsystem restart
++ * @subsys_dev: ssr device handle.
++ * @np: device tree node for esoc_clink.
++ * @auto_boot: boots independently.
++ * @primary: primary esoc controls(reset/poweroff) all secondary
++ *	 esocs, but not	otherway around.
++ * @statusline_not_a_powersource: True if status line to esoc is not a
++ *				power source.
++ * @userspace_handle_shutdown: True if user space handles shutdown requests.
++ * @ssctl_id: SSCTL id for a subsystem.
++ * @sysmon_name: Sysmon name for external soc
++ * @dbg_dir: Debugfs entry associated to this clink
++ */
++struct esoc_clink {
++	const char *name;
++	const char *link_name;
++	const char *link_info;
++	struct device *parent;
++	struct device dev;
++	struct platform_device *pdev;
++	unsigned int id;
++	struct module *owner;
++	const struct esoc_clink_ops *clink_ops;
++	struct esoc_eng *req_eng;
++	struct esoc_eng *cmd_eng;
++	spinlock_t notify_lock;
++	void *clink_data;
++	void *compat_data;
++	const char *fw;
++	struct rproc *rproc;
++	struct rproc_ops ops;
++	struct qcom_sysmon *rproc_sysmon;
++	struct device_node *np;
++	bool auto_boot;
++	bool primary;
++	bool statusline_not_a_powersource;
++	bool userspace_handle_shutdown;
++	struct esoc_client_hook *client_hook[ESOC_MAX_HOOKS];
++	int ssctl_id;
++	char *sysmon_name;
++	struct dentry *dbg_dir;
++};
++
++/**
++ * struct esoc_clink_ops: Operations to control external soc
++ * @cmd_exe: Execute control command
++ * @get_status: Get current status, or response to previous command
++ * @get_err_fatal: Get status of err fatal signal
++ * @notify_esoc: notify external soc of events
++ */
++struct esoc_clink_ops {
++	int (*cmd_exe)(enum esoc_cmd cmd, struct esoc_clink *dev);
++	void (*get_status)(u32 *status, struct esoc_clink *dev);
++	void (*get_err_fatal)(u32 *status, struct esoc_clink *dev);
++	void (*notify)(enum esoc_notify notify, struct esoc_clink *dev);
++};
++
++/**
++ * struct esoc_compat: Compatibility of esoc drivers.
++ * @name: esoc link that driver is compatible with.
++ * @data: driver data associated with esoc clink.
++ */
++struct esoc_compat {
++	const char *name;
++	void *data;
++};
++
++/**
++ * struct esoc_drv: Driver for an esoc clink
++ * @driver: drivers for esoc.
++ * @owner: module owner of esoc driver.
++ * @compat_table: compatible table for driver.
++ * @compat_entries
++ * @probe: probe function for esoc driver.
++ */
++struct esoc_drv {
++	struct device_driver driver;
++	struct module *owner;
++	struct esoc_compat *compat_table;
++	unsigned int compat_entries;
++	int (*probe)(struct esoc_clink *esoc_clink, struct esoc_drv *drv);
++	int (*remove)(struct esoc_clink *esoc_clink, struct esoc_drv *drv);
++};
++
++#define to_esoc_clink(d) container_of(d, struct esoc_clink, dev)
++#define to_esoc_drv(d) container_of(d, struct esoc_drv, driver)
++
++typedef int (*esoc_func_t)(struct device *dev, void *data);
++
++extern struct bus_type esoc_bus_type;
++
++
++/* Exported apis */
++void esoc_dev_exit(void);
++int esoc_dev_init(void);
++void mdm_drv_exit(void);
++int mdm_drv_init(void);
++void esoc_bus_exit(void);
++int esoc_bus_init(void);
++void esoc_clink_unregister(struct esoc_clink *esoc_dev);
++int esoc_clink_register(struct esoc_clink *esoc_dev);
++struct esoc_clink *get_esoc_clink(int id);
++struct esoc_clink *get_esoc_clink_by_node(struct device_node *node);
++void put_esoc_clink(struct esoc_clink *esoc_clink);
++void *get_esoc_clink_data(struct esoc_clink *esoc);
++void set_esoc_clink_data(struct esoc_clink *esoc, void *data);
++void esoc_clink_evt_notify(enum esoc_evt, struct esoc_clink *esoc_dev);
++void esoc_clink_queue_request(enum esoc_req req, struct esoc_clink *esoc_dev);
++void *esoc_device_get_match_data(struct device *dev);
++void esoc_for_each_dev(void *data, esoc_func_t fn);
++int esoc_clink_register_cmd_eng(struct esoc_clink *esoc_clink, struct esoc_eng *eng);
++void esoc_clink_unregister_cmd_eng(struct esoc_clink *esoc_clink, struct esoc_eng *eng);
++int esoc_clink_register_req_eng(struct esoc_clink *esoc_clink, struct esoc_eng *eng);
++void esoc_clink_unregister_req_eng(struct esoc_clink *esoc_clink, struct esoc_eng *eng);
++int esoc_driver_register(struct esoc_drv *driver);
++void esoc_driver_unregister(struct esoc_drv *driver);
++void esoc_set_drv_data(struct esoc_clink *esoc_clink, void *data);
++void *esoc_get_drv_data(struct esoc_clink *esoc_clink);
++int esoc_clink_add_device(struct device *dev, void *dummy);
++int esoc_clink_del_device(struct device *dev, void *dummy);
++/* ssr operations */
++int esoc_clink_register_rproc(struct esoc_clink *esoc_clink);
++int esoc_clink_request_ssr(struct esoc_clink *esoc_clink);
++void esoc_clink_unregister_rproc(struct esoc_clink *esoc_clink);
++/* client notification */
++void notify_esoc_clients(struct esoc_clink *esoc_clink, unsigned long evt);
++bool esoc_req_eng_enabled(struct esoc_clink *esoc_clink);
++bool esoc_cmd_eng_enabled(struct esoc_clink *esoc_clink);
++#endif
++
++/* Modem boot fail actions */
++int esoc_set_boot_fail_action(struct esoc_clink *esoc_clink, u32 action);
++int esoc_set_n_pon_tries(struct esoc_clink *esoc_clink, u32 n_tries);
+--- /dev/null
++++ b/drivers/remoteproc/esoc_bus.c
+@@ -0,0 +1,531 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2013-2015, 2017-2018, 2020-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/idr.h>
++#include <linux/of_device.h>
++#include <linux/slab.h>
++#include "esoc.h"
++
++static DEFINE_IDA(esoc_ida);
++
++/* SYSFS */
++static ssize_t esoc_name_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return scnprintf(buf, ESOC_NAME_LEN, "%s", to_esoc_clink(dev)->name);
++}
++
++static ssize_t esoc_link_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return scnprintf(buf, ESOC_LINK_LEN, "%s", to_esoc_clink(dev)->link_name);
++}
++
++static ssize_t esoc_link_info_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return scnprintf(buf, ESOC_LINK_LEN, "%s", to_esoc_clink(dev)->link_info);
++}
++
++static DEVICE_ATTR_RO(esoc_name);
++static DEVICE_ATTR_RO(esoc_link);
++static DEVICE_ATTR_RO(esoc_link_info);
++
++static ssize_t modalias_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct esoc_clink *esoc = to_esoc_clink(dev);
++	int len;
++
++	/*
++	 * Userspace rmtfs on postmarketOS only recognizes modem remoteprocs
++	 * through the legacy qcom-q6v5-mss modalias path. Umi exposes the
++	 * modem through the ESOC bus, so provide a compatible OF modalias for
++	 * the external SDX55M modem until userspace learns the newer ESOC
++	 * layout.
++	 */
++	if (esoc->np && of_device_is_compatible(esoc->np, "qcom,ext-sdx55m"))
++		return sysfs_emit(buf,
++				  "of:Nqcom,ext-sdx55m-mss-pilT(null)Cqcom,ext-sdx55m-mss-pil\n");
++
++	len = of_device_modalias(dev, buf, PAGE_SIZE);
++	if (len != -ENODEV)
++		return len;
++
++	return sysfs_emit(buf, "esoc:%s\n", esoc->name);
++}
++static DEVICE_ATTR_RO(modalias);
++
++static struct attribute *esoc_clink_attrs[] = {
++	&dev_attr_esoc_name.attr,
++	&dev_attr_esoc_link.attr,
++	&dev_attr_esoc_link_info.attr,
++	&dev_attr_modalias.attr,
++	NULL
++};
++
++static struct attribute_group esoc_clink_attr_group = {
++	.attrs = esoc_clink_attrs,
++};
++
++const struct attribute_group *esoc_clink_attr_groups[] = {
++	&esoc_clink_attr_group,
++	NULL,
++};
++
++static int esoc_bus_match(struct device *dev, const struct device_driver *drv)
++{
++	int i = 0, match = 1;
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++	struct esoc_drv *esoc_drv = to_esoc_drv(drv);
++	int entries = esoc_drv->compat_entries;
++	struct esoc_compat *table = esoc_drv->compat_table;
++
++	for (i = 0; i < entries; i++) {
++		if (strcasecmp(esoc_clink->name, table[i].name) == 0)
++			return match;
++	}
++	return 0;
++}
++
++void *esoc_device_get_match_data(struct device *dev)
++{
++	int i = 0;
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++	struct esoc_drv *esoc_drv = to_esoc_drv(dev->driver);
++	int entries = esoc_drv->compat_entries;
++	struct esoc_compat *table = esoc_drv->compat_table;
++
++	for (i = 0; i < entries; i++) {
++		if (strcasecmp(esoc_clink->name, table[i].name) == 0)
++			return table[i].data;
++	}
++
++	return ERR_PTR(-EINVAL);
++}
++
++static int esoc_bus_probe(struct device *dev)
++{
++	int ret;
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++	struct esoc_drv *esoc_drv = to_esoc_drv(dev->driver);
++
++	ret = esoc_drv->probe(esoc_clink, esoc_drv);
++	if (ret)
++		pr_err("failed to probe %s dev\n", esoc_clink->name);
++	return ret;
++}
++
++static int esoc_bus_remove(struct device *dev)
++{
++	int ret;
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++	struct esoc_drv *esoc_drv = to_esoc_drv(dev->driver);
++
++	ret = esoc_drv->remove(esoc_clink, esoc_drv);
++	if (ret)
++		pr_err("failed to remove %s dev\n", esoc_clink->name);
++	return ret;
++}
++
++static int esoc_bus_uevent(const struct device *dev, struct kobj_uevent_env *env)
++{
++	struct esoc_clink *esoc = to_esoc_clink(dev);
++	int ret;
++
++	if (esoc->np && of_device_is_compatible(esoc->np, "qcom,ext-sdx55m"))
++		return add_uevent_var(env,
++				      "MODALIAS=of:Nqcom,ext-sdx55m-mss-pilT(null)Cqcom,ext-sdx55m-mss-pil");
++
++	ret = of_device_uevent_modalias(dev, env);
++	if (ret != -ENODEV)
++		return ret;
++
++	return add_uevent_var(env, "MODALIAS=esoc:%s", esoc->name);
++}
++
++struct bus_type esoc_bus_type = {
++	.name = "esoc",
++	.match = esoc_bus_match,
++	.dev_groups = esoc_clink_attr_groups,
++	.uevent = esoc_bus_uevent,
++};
++
++struct device esoc_bus = {
++	.init_name = "esoc-bus"
++};
++
++/* bus accessor */
++static void esoc_clink_release(struct device *dev)
++{
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++
++	ida_free(&esoc_ida, esoc_clink->id);
++	kfree(esoc_clink);
++}
++
++static int esoc_clink_match_id(struct device *dev, const void *id)
++{
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++	int *esoc_id = (int *)id;
++
++	if (esoc_clink->id == *esoc_id) {
++		if (!try_module_get(esoc_clink->owner))
++			return 0;
++		return 1;
++	}
++	return 0;
++}
++
++static int esoc_clink_match_node(struct device *dev, const void *id)
++{
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++
++	if (esoc_clink->np == id) {
++		if (!try_module_get(esoc_clink->owner))
++			return 0;
++		return 1;
++	}
++	return 0;
++}
++
++void esoc_for_each_dev(void *data, esoc_func_t fn)
++{
++	bus_for_each_dev(&esoc_bus_type, NULL, data, fn);
++}
++
++
++struct esoc_clink *get_esoc_clink(int id)
++{
++	struct esoc_clink *esoc_clink;
++	struct device *dev;
++
++	dev = bus_find_device(&esoc_bus_type, NULL, &id, esoc_clink_match_id);
++	if (IS_ERR_OR_NULL(dev))
++		return NULL;
++	esoc_clink = to_esoc_clink(dev);
++	return esoc_clink;
++}
++
++struct esoc_clink *get_esoc_clink_by_node(struct device_node *node)
++{
++	struct esoc_clink *esoc_clink;
++	struct device *dev;
++
++	dev = bus_find_device(&esoc_bus_type, NULL, node, esoc_clink_match_node);
++	if (IS_ERR_OR_NULL(dev))
++		return NULL;
++	esoc_clink = to_esoc_clink(dev);
++	return esoc_clink;
++}
++
++void put_esoc_clink(struct esoc_clink *esoc_clink)
++{
++	module_put(esoc_clink->owner);
++}
++
++bool esoc_req_eng_enabled(struct esoc_clink *esoc_clink)
++{
++	return !esoc_clink->req_eng ? false : true;
++}
++
++bool esoc_cmd_eng_enabled(struct esoc_clink *esoc_clink)
++{
++	return !esoc_clink->cmd_eng ? false : true;
++}
++/* ssr operations */
++int esoc_clink_register_rproc(struct esoc_clink *esoc_clink)
++{
++	int ret;
++	int len;
++	char *rproc_name;
++
++	len = strlen("esoc") + sizeof(esoc_clink->id);
++	rproc_name = kzalloc(len, GFP_KERNEL);
++	if (IS_ERR_OR_NULL(rproc_name))
++		return PTR_ERR(rproc_name);
++
++	snprintf(rproc_name, len, "esoc%d", esoc_clink->id);
++	esoc_clink->dev.of_node = esoc_clink->np;
++	esoc_clink->rproc = rproc_alloc(&esoc_clink->dev, rproc_name,
++					&esoc_clink->ops, esoc_clink->fw, 0);
++	if (!esoc_clink->rproc) {
++		dev_err(&esoc_clink->dev, "unable to allocate remoteproc\n");
++		ret = -ENOMEM;
++		goto rproc_err;
++	}
++
++	esoc_clink->rproc->recovery_disabled = false;
++	esoc_clink->rproc->auto_boot = esoc_clink->auto_boot;
++
++	dev_info(&esoc_clink->dev,
++		 "esoc: adding sysmon subdev name=%s ssctl_id=0x%x\n",
++		 esoc_clink->sysmon_name, esoc_clink->ssctl_id);
++	esoc_clink->rproc_sysmon = qcom_add_sysmon_subdev(esoc_clink->rproc,
++							  esoc_clink->sysmon_name,
++							  esoc_clink->ssctl_id);
++	if (IS_ERR(esoc_clink->rproc_sysmon)) {
++		dev_err(&esoc_clink->dev, "Failed to register sysmon\n");
++		ret = PTR_ERR(esoc_clink->rproc_sysmon);
++		goto rproc_err;
++	}
++	dev_info(&esoc_clink->dev, "esoc: sysmon subdev added OK\n");
++
++	ret = rproc_add(esoc_clink->rproc);
++	if (ret) {
++		dev_err(&esoc_clink->dev, "unable to add remoteproc\n");
++		goto remove_subdev;
++	}
++
++	return 0;
++
++remove_subdev:
++	if (esoc_clink->rproc_sysmon)
++		qcom_remove_sysmon_subdev(esoc_clink->rproc_sysmon);
++rproc_err:
++	kfree(rproc_name);
++	return ret;
++}
++
++void esoc_clink_unregister_rproc(struct esoc_clink *esoc_clink)
++{
++	rproc_del(esoc_clink->rproc);
++	if (esoc_clink->rproc_sysmon)
++		qcom_remove_sysmon_subdev(esoc_clink->rproc_sysmon);
++	rproc_free(esoc_clink->rproc);
++}
++
++int esoc_clink_request_ssr(struct esoc_clink *esoc_clink)
++{
++	if (esoc_clink->rproc->recovery_disabled) {
++		dev_err(&esoc_clink->dev,
++			"remoteproc %s crashed but recovery is disabled\n",
++			esoc_clink->rproc->name);
++		return -EOPNOTSUPP;
++	}
++	rproc_report_crash(esoc_clink->rproc, RPROC_FATAL_ERROR);
++	return 0;
++}
++
++/* bus operations */
++void esoc_clink_evt_notify(enum esoc_evt evt, struct esoc_clink *esoc_clink)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&esoc_clink->notify_lock, flags);
++	notify_esoc_clients(esoc_clink, evt);
++	if (esoc_clink->req_eng && esoc_clink->req_eng->handle_clink_evt)
++		esoc_clink->req_eng->handle_clink_evt(evt, esoc_clink->req_eng);
++	if (esoc_clink->cmd_eng && esoc_clink->cmd_eng->handle_clink_evt)
++		esoc_clink->cmd_eng->handle_clink_evt(evt, esoc_clink->cmd_eng);
++	spin_unlock_irqrestore(&esoc_clink->notify_lock, flags);
++}
++
++void *get_esoc_clink_data(struct esoc_clink *esoc)
++{
++	return esoc->clink_data;
++}
++
++void set_esoc_clink_data(struct esoc_clink *esoc, void *data)
++{
++	esoc->clink_data = data;
++}
++
++void esoc_clink_queue_request(enum esoc_req req, struct esoc_clink *esoc_clink)
++{
++	unsigned long flags;
++	struct esoc_eng *req_eng;
++
++	spin_lock_irqsave(&esoc_clink->notify_lock, flags);
++	if (esoc_clink->req_eng != NULL) {
++		req_eng = esoc_clink->req_eng;
++		req_eng->handle_clink_req(req, req_eng);
++	}
++	spin_unlock_irqrestore(&esoc_clink->notify_lock, flags);
++}
++
++void esoc_set_drv_data(struct esoc_clink *esoc_clink, void *data)
++{
++	dev_set_drvdata(&esoc_clink->dev, data);
++}
++
++void *esoc_get_drv_data(struct esoc_clink *esoc_clink)
++{
++	return dev_get_drvdata(&esoc_clink->dev);
++}
++
++/* bus registration functions */
++void esoc_clink_unregister(struct esoc_clink *esoc_clink)
++{
++	if (get_device(&esoc_clink->dev) != NULL) {
++		esoc_clink_del_device(&esoc_clink->dev, NULL);
++		device_unregister(&esoc_clink->dev);
++		put_device(&esoc_clink->dev);
++		ida_free(&esoc_ida, esoc_clink->id);
++	}
++}
++
++int esoc_clink_register(struct esoc_clink *esoc_clink)
++{
++	int id, err;
++	struct device *dev;
++
++	if (!esoc_clink->name || !esoc_clink->link_name || !esoc_clink->clink_ops) {
++		dev_err(esoc_clink->parent, "invalid esoc arguments\n");
++		return -EINVAL;
++	}
++	id = ida_alloc_range(&esoc_ida, 0, ESOC_DEV_MAX - 1, GFP_KERNEL);
++	if (id < 0) {
++		err = id;
++		goto exit_ida;
++	}
++	esoc_clink->id = id;
++	dev = &esoc_clink->dev;
++	dev->bus = &esoc_bus_type;
++	dev->release = esoc_clink_release;
++	spin_lock_init(&esoc_clink->notify_lock);
++	if (!esoc_clink->parent)
++		dev->parent = &esoc_bus;
++	else
++		dev->parent = esoc_clink->parent;
++	dev_set_name(dev, "esoc%d", id);
++	err = device_register(dev);
++	if (err) {
++		dev_err(esoc_clink->parent, "esoc device register failed\n");
++		put_device(dev);
++		goto exit_ida;
++	}
++
++	err = esoc_clink_add_device(&esoc_clink->dev, NULL);
++	if (err)
++		goto exit_dev_add;
++
++	return 0;
++exit_dev_add:
++	device_unregister(dev);
++exit_ida:
++	ida_free(&esoc_ida, id);
++	pr_err("unable to register %s, err = %d\n", esoc_clink->name, err);
++	return err;
++}
++
++int esoc_clink_register_req_eng(struct esoc_clink *esoc_clink,
++						struct esoc_eng *eng)
++{
++	if (esoc_clink->req_eng)
++		return -EBUSY;
++	if (!eng->handle_clink_req)
++		return -EINVAL;
++	esoc_clink->req_eng = eng;
++	eng->esoc_clink = esoc_clink;
++	esoc_clink_evt_notify(ESOC_REQ_ENG_ON, esoc_clink);
++	return 0;
++}
++
++int esoc_clink_register_cmd_eng(struct esoc_clink *esoc_clink,
++						struct esoc_eng *eng)
++{
++	if (esoc_clink->cmd_eng)
++		return -EBUSY;
++	esoc_clink->cmd_eng = eng;
++	eng->esoc_clink = esoc_clink;
++	esoc_clink_evt_notify(ESOC_CMD_ENG_ON, esoc_clink);
++	return 0;
++}
++
++void esoc_clink_unregister_req_eng(struct esoc_clink *esoc_clink,
++						struct esoc_eng *eng)
++{
++	esoc_clink->req_eng = NULL;
++	esoc_clink_evt_notify(ESOC_REQ_ENG_OFF, esoc_clink);
++}
++
++void esoc_clink_unregister_cmd_eng(struct esoc_clink *esoc_clink,
++						struct esoc_eng *eng)
++{
++	esoc_clink->cmd_eng = NULL;
++	esoc_clink_evt_notify(ESOC_CMD_ENG_OFF, esoc_clink);
++}
++
++int esoc_driver_register(struct esoc_drv *driver)
++{
++	int ret;
++
++	driver->driver.bus = &esoc_bus_type;
++	driver->driver.probe = esoc_bus_probe;
++	driver->driver.remove = esoc_bus_remove;
++	ret = driver_register(&driver->driver);
++	if (ret)
++		return ret;
++	return 0;
++}
++
++void esoc_driver_unregister(struct esoc_drv *driver)
++{
++	driver_unregister(&driver->driver);
++}
++
++int esoc_bus_init(void)
++{
++	int ret;
++
++	ret = device_register(&esoc_bus);
++	if (ret) {
++		pr_err("esoc bus device register fail\n");
++		return ret;
++	}
++	ret = bus_register(&esoc_bus_type);
++	if (ret) {
++		pr_err("esoc bus register fail\n");
++		return ret;
++	}
++	pr_debug("esoc bus registration done\n");
++	//TODO: add cleanup path
++	ret = esoc_dev_init();
++	if (ret) {
++		pr_err("esoc userspace driver initialization failed\n");
++		return ret;
++	}
++	ret = mdm_drv_init();
++	if (ret) {
++		pr_err("esoc failed to initialize ssr driver\n");
++		return ret;
++	}
++	return 0;
++}
++
++void esoc_bus_exit(void)
++{
++	mdm_drv_exit();
++	esoc_dev_exit();
++	bus_unregister(&esoc_bus_type);
++	device_unregister(&esoc_bus);
++}
++
++EXPORT_SYMBOL(esoc_bus_init);
++EXPORT_SYMBOL(esoc_bus_exit);
++EXPORT_SYMBOL(esoc_driver_register);
++EXPORT_SYMBOL(esoc_driver_unregister);
++EXPORT_SYMBOL(esoc_req_eng_enabled);
++EXPORT_SYMBOL(get_esoc_clink_data);
++EXPORT_SYMBOL(set_esoc_clink_data);
++EXPORT_SYMBOL(esoc_clink_register);
++EXPORT_SYMBOL(esoc_clink_unregister);
++EXPORT_SYMBOL(esoc_clink_request_ssr);
++EXPORT_SYMBOL(esoc_get_drv_data);
++EXPORT_SYMBOL(esoc_set_drv_data);
++EXPORT_SYMBOL(esoc_clink_register_rproc);
++EXPORT_SYMBOL(esoc_clink_unregister_rproc);
++EXPORT_SYMBOL(esoc_clink_register_req_eng);
++EXPORT_SYMBOL(esoc_clink_unregister_req_eng);
++EXPORT_SYMBOL(esoc_clink_register_cmd_eng);
++EXPORT_SYMBOL(esoc_clink_unregister_cmd_eng);
++EXPORT_SYMBOL(esoc_clink_queue_request);
++EXPORT_SYMBOL(esoc_clink_evt_notify);
++EXPORT_SYMBOL(esoc_device_get_match_data);
++EXPORT_SYMBOL(get_esoc_clink);
++EXPORT_SYMBOL(put_esoc_clink);
++EXPORT_SYMBOL(esoc_for_each_dev);
++EXPORT_SYMBOL(get_esoc_clink_by_node);
++
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/remoteproc/esoc_client.c
+@@ -0,0 +1,192 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2014-2018, 2020-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/esoc_client.h>
++#include <linux/of.h>
++#include <linux/spinlock.h>
++#include "esoc.h"
++
++static DEFINE_SPINLOCK(notify_lock);
++static ATOMIC_NOTIFIER_HEAD(client_notify);
++
++static void devm_esoc_desc_release(struct device *dev, void *res)
++{
++	struct esoc_desc *esoc_desc = res;
++
++	kfree(esoc_desc->name);
++	kfree(esoc_desc->link);
++	put_esoc_clink(esoc_desc->priv);
++}
++
++static int devm_esoc_desc_match(struct device *dev, void *res, void *data)
++{
++	struct esoc_desc *esoc_desc = res;
++	return esoc_desc == data;
++}
++
++struct esoc_desc *devm_register_esoc_client(struct device *dev,
++							const char *name)
++{
++	int ret, index;
++	const char *client_desc;
++	char *esoc_prop;
++	const __be32 *parp;
++	struct device_node *esoc_node;
++	struct device_node *np = dev->of_node;
++	struct esoc_clink *esoc_clink;
++	struct esoc_desc *desc;
++	char *esoc_name, *esoc_link, *esoc_link_info;
++
++	for (index = 0;; index++) {
++		esoc_prop = kasprintf(GFP_KERNEL, "esoc-%d", index);
++		if (IS_ERR_OR_NULL(esoc_prop))
++			return ERR_PTR(-ENOMEM);
++		parp = of_get_property(np, esoc_prop, NULL);
++		if (parp == NULL) {
++			dev_err(dev, "esoc device not present\n");
++			kfree(esoc_prop);
++			return NULL;
++		}
++		ret = of_property_read_string_index(np, "esoc-names", index, &client_desc);
++		if (ret) {
++			dev_err(dev, "cannot find matching string\n");
++			kfree(esoc_prop);
++			return NULL;
++		}
++		if (strcmp(client_desc, name)) {
++			kfree(esoc_prop);
++			continue;
++		}
++		kfree(esoc_prop);
++		esoc_node = of_find_node_by_phandle(be32_to_cpup(parp));
++		esoc_clink = get_esoc_clink_by_node(esoc_node);
++		if (IS_ERR_OR_NULL(esoc_clink)) {
++			dev_err(dev, "matching esoc clink not present\n");
++			return ERR_PTR(-EPROBE_DEFER);
++		}
++		esoc_name = kasprintf(GFP_KERNEL, "esoc%d", esoc_clink->id);
++		if (IS_ERR_OR_NULL(esoc_name)) {
++			dev_err(dev, "unable to allocate esoc name\n");
++			return ERR_PTR(-ENOMEM);
++		}
++		esoc_link = kasprintf(GFP_KERNEL, "%s", esoc_clink->link_name);
++		if (IS_ERR_OR_NULL(esoc_link)) {
++			dev_err(dev, "unable to allocate esoc link name\n");
++			kfree(esoc_name);
++			return ERR_PTR(-ENOMEM);
++		}
++		esoc_link_info = kasprintf(GFP_KERNEL, "%s", esoc_clink->link_info);
++		if (IS_ERR_OR_NULL(esoc_link_info)) {
++			dev_err(dev, "unable to alloc link info name\n");
++			kfree(esoc_name);
++			kfree(esoc_link);
++			return ERR_PTR(-ENOMEM);
++		}
++		desc = devres_alloc(devm_esoc_desc_release, sizeof(*desc), GFP_KERNEL);
++		if (IS_ERR_OR_NULL(desc)) {
++			kfree(esoc_name);
++			kfree(esoc_link);
++			kfree(esoc_link_info);
++			dev_err(dev, "unable to allocate esoc descriptor\n");
++			return ERR_PTR(-ENOMEM);
++		}
++		desc->name = esoc_name;
++		desc->link = esoc_link;
++		desc->link_info = esoc_link_info;
++		desc->priv = esoc_clink;
++		devres_add(dev, desc);
++		return desc;
++	}
++	return NULL;
++}
++EXPORT_SYMBOL(devm_register_esoc_client);
++
++void devm_unregister_esoc_client(struct device *dev, struct esoc_desc *esoc_desc)
++{
++	int ret;
++
++	ret = devres_release(dev, devm_esoc_desc_release, devm_esoc_desc_match, esoc_desc);
++	WARN_ON(ret);
++}
++EXPORT_SYMBOL(devm_unregister_esoc_client);
++
++int esoc_register_client_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&client_notify, nb);
++}
++EXPORT_SYMBOL(esoc_register_client_notifier);
++
++void notify_esoc_clients(struct esoc_clink *esoc_clink, unsigned long evt)
++{
++	unsigned int id;
++	unsigned long flags;
++
++	spin_lock_irqsave(&notify_lock, flags);
++	id = esoc_clink->id;
++	atomic_notifier_call_chain(&client_notify, evt, &id);
++	spin_unlock_irqrestore(&notify_lock, flags);
++}
++EXPORT_SYMBOL(notify_esoc_clients);
++
++int esoc_register_client_hook(struct esoc_desc *desc, struct esoc_client_hook *client_hook)
++{
++	int i;
++	struct esoc_clink *esoc_clink;
++
++	if (IS_ERR_OR_NULL(desc) || IS_ERR_OR_NULL(client_hook)) {
++		pr_debug("%s: Invalid parameters\n", __func__);
++		return -EINVAL;
++	}
++
++	esoc_clink = desc->priv;
++	if (IS_ERR_OR_NULL(esoc_clink)) {
++		pr_debug("%s: Invalid esoc link\n", __func__);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < ESOC_MAX_HOOKS; i++) {
++		if (i == client_hook->prio &&
++			esoc_clink->client_hook[i] == NULL) {
++			esoc_clink->client_hook[i] = client_hook;
++			dev_dbg(&esoc_clink->dev, "Client hook registration successful\n");
++			return 0;
++		}
++	}
++
++	dev_dbg(&esoc_clink->dev, "Client hook registration failed!\n");
++	return -EINVAL;
++}
++EXPORT_SYMBOL(esoc_register_client_hook);
++
++int esoc_unregister_client_hook(struct esoc_desc *desc, struct esoc_client_hook *client_hook)
++{
++	int i;
++	struct esoc_clink *esoc_clink;
++
++	if (IS_ERR_OR_NULL(desc) || IS_ERR_OR_NULL(client_hook)) {
++		pr_debug("%s: Invalid parameters\n", __func__);
++		return -EINVAL;
++	}
++
++	esoc_clink = desc->priv;
++	if (IS_ERR_OR_NULL(esoc_clink)) {
++		pr_debug("%s: Invalid esoc link\n", __func__);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < ESOC_MAX_HOOKS; i++) {
++		if (i == client_hook->prio && esoc_clink->client_hook[i] != NULL) {
++			esoc_clink->client_hook[i] = NULL;
++			dev_dbg(&esoc_clink->dev, "Client hook unregistration successful\n");
++			return 0;
++		}
++	}
++
++	dev_dbg(&esoc_clink->dev, "Client hook unregistration failed!\n");
++	return -EINVAL;
++}
++EXPORT_SYMBOL(esoc_unregister_client_hook);
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/remoteproc/esoc_dev.c
+@@ -0,0 +1,454 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2013-2014, 2017-2018, 2020-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++#include <linux/kfifo.h>
++#include <linux/list.h>
++#include <linux/sched.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++#include <linux/esoc_client.h>
++#include "esoc.h"
++
++/**
++ * struct esoc_udev: Userspace char interface
++ * @dev: interface device.
++ * @req_fifio: fifo for clink requests.
++ * @req_wait: signal availability of request from clink
++ * @req_fifo_lock: serialize access to req fifo
++ * @evt_fito: fifo for clink events
++ * @evt_wait: signal availability of clink event
++ * @evt_fifo_lock: serialize access to event fifo
++ * @list: entry in esoc dev list.
++ * @clink: reference to contorl link
++ */
++struct esoc_udev {
++	struct device *dev;
++	struct kfifo req_fifo;
++	wait_queue_head_t req_wait;
++	spinlock_t req_fifo_lock;
++	struct kfifo evt_fifo;
++	wait_queue_head_t evt_wait;
++	spinlock_t evt_fifo_lock;
++	struct list_head list;
++	struct esoc_clink *clink;
++};
++
++/**
++ * struct esoc_uhandle: Userspace handle of esoc
++ * @esoc_clink: esoc control link.
++ * @eng: esoc engine for commands/ requests.
++ * @esoc_udev: user interface device.
++ * @req_eng_reg: indicates if engine is registered as request eng
++ * @cmd_eng_reg: indicates if engine is registered as cmd eng
++ */
++struct esoc_uhandle {
++	struct esoc_clink *esoc_clink;
++	struct esoc_eng eng;
++	struct esoc_udev *esoc_udev;
++	bool req_eng_reg;
++	bool cmd_eng_reg;
++};
++
++#define ESOC_MAX_MINOR	256
++#define ESOC_MAX_REQ	8
++#define ESOC_MAX_EVT	4
++
++static LIST_HEAD(esoc_udev_list);
++static DEFINE_SPINLOCK(esoc_udev_list_lock);
++struct class *esoc_class;
++static int esoc_major;
++
++static struct esoc_udev *get_free_esoc_udev(struct esoc_clink *esoc_clink)
++{
++	struct esoc_udev *esoc_udev;
++	int err;
++
++	if (esoc_clink->id > ESOC_MAX_MINOR) {
++		pr_err("too many esoc devices\n");
++		return ERR_PTR(-ENODEV);
++	}
++	esoc_udev = kzalloc(sizeof(*esoc_udev), GFP_KERNEL);
++	if (!esoc_udev)
++		return ERR_PTR(-ENOMEM);
++	err = kfifo_alloc(&esoc_udev->req_fifo, (sizeof(u32)) * ESOC_MAX_REQ, GFP_KERNEL);
++	if (err) {
++		pr_err("unable to allocate request fifo for %s\n", esoc_clink->name);
++		goto req_fifo_fail;
++	}
++	err = kfifo_alloc(&esoc_udev->evt_fifo, (sizeof(u32)) * ESOC_MAX_EVT, GFP_KERNEL);
++	if (err) {
++		pr_err("unable to allocate evt fifo for %s\n", esoc_clink->name);
++		goto evt_fifo_fail;
++	}
++	init_waitqueue_head(&esoc_udev->req_wait);
++	init_waitqueue_head(&esoc_udev->evt_wait);
++	spin_lock_init(&esoc_udev->req_fifo_lock);
++	spin_lock_init(&esoc_udev->evt_fifo_lock);
++	esoc_udev->clink = esoc_clink;
++	spin_lock(&esoc_udev_list_lock);
++	list_add_tail(&esoc_udev->list, &esoc_udev_list);
++	spin_unlock(&esoc_udev_list_lock);
++	return esoc_udev;
++evt_fifo_fail:
++	kfifo_free(&esoc_udev->req_fifo);
++req_fifo_fail:
++	kfree(esoc_udev);
++	return ERR_PTR(-ENODEV);
++}
++
++static void return_esoc_udev(struct esoc_udev *esoc_udev)
++{
++	spin_lock(&esoc_udev_list_lock);
++	list_del(&esoc_udev->list);
++	spin_unlock(&esoc_udev_list_lock);
++	kfifo_free(&esoc_udev->req_fifo);
++	kfifo_free(&esoc_udev->evt_fifo);
++	kfree(esoc_udev);
++}
++
++static struct esoc_udev *esoc_udev_get_by_minor(unsigned int index)
++{
++	struct esoc_udev *esoc_udev;
++
++	spin_lock(&esoc_udev_list_lock);
++	list_for_each_entry(esoc_udev, &esoc_udev_list, list) {
++		if (esoc_udev->clink->id == index)
++			goto found;
++	}
++	esoc_udev = NULL;
++found:
++	spin_unlock(&esoc_udev_list_lock);
++	return esoc_udev;
++}
++
++static void esoc_udev_handle_clink_req(enum esoc_req req, struct esoc_eng *eng)
++{
++	int err;
++	u32 clink_req;
++	struct esoc_clink *esoc_clink = eng->esoc_clink;
++	struct esoc_udev *esoc_udev = esoc_udev_get_by_minor(esoc_clink->id);
++
++	if (!esoc_udev) {
++		esoc_mdm_log("esoc_udev not found\n");
++		return;
++	}
++	clink_req = (u32)req;
++	err = kfifo_in_spinlocked(&esoc_udev->req_fifo, &clink_req, sizeof(clink_req),
++				  &esoc_udev->req_fifo_lock);
++	if (err != sizeof(clink_req)) {
++		esoc_mdm_log("Unable to queue request %d; err: %d\n", req, err);
++		pr_err("unable to queue request for %s\n", esoc_clink->name);
++		return;
++	}
++	wake_up_interruptible(&esoc_udev->req_wait);
++}
++
++static void esoc_udev_handle_clink_evt(enum esoc_evt evt, struct esoc_eng *eng)
++{
++	int err;
++	u32 clink_evt;
++	struct esoc_clink *esoc_clink = eng->esoc_clink;
++	struct esoc_udev *esoc_udev = esoc_udev_get_by_minor(esoc_clink->id);
++
++	if (!esoc_udev) {
++		esoc_mdm_log("esoc_udev not found\n");
++		return;
++	}
++	clink_evt = (u32)evt;
++	err = kfifo_in_spinlocked(&esoc_udev->evt_fifo, &clink_evt, sizeof(clink_evt),
++				  &esoc_udev->evt_fifo_lock);
++	if (err != sizeof(clink_evt)) {
++		esoc_mdm_log("Unable to queue event %d; err: %d\n", evt, err);
++		pr_err("unable to queue event for %s\n", esoc_clink->name);
++		return;
++	}
++	wake_up_interruptible(&esoc_udev->evt_wait);
++}
++
++static int esoc_get_link_id(struct esoc_clink *esoc_clink, unsigned long arg)
++{
++	struct esoc_link_data link_data;
++	struct esoc_client_hook *client_hook;
++	struct esoc_link_data __user *user_arg;
++
++	user_arg = (struct esoc_link_data __user *) arg;
++	if (!user_arg) {
++		dev_err(&esoc_clink->dev, "Missing argument for link id\n");
++		return -EINVAL;
++	}
++
++	if (copy_from_user((void *) &link_data, user_arg, sizeof(*user_arg))) {
++		dev_err(&esoc_clink->dev, "Unable to copy the data from the user\n");
++		return -EFAULT;
++	}
++
++	if (link_data.prio < 0 || link_data.prio >= ESOC_MAX_HOOKS) {
++		dev_err(&esoc_clink->dev, "Invalid client identifier passed\n");
++		return -EINVAL;
++	}
++
++	client_hook = esoc_clink->client_hook[link_data.prio];
++	if (client_hook && client_hook->esoc_link_get_id) {
++		link_data.link_id = client_hook->esoc_link_get_id(client_hook->priv);
++
++		if (copy_to_user((void *) user_arg, &link_data, sizeof(*user_arg))) {
++			dev_err(&esoc_clink->dev, "Failed to send the data to the user\n");
++			return -EFAULT;
++		}
++
++		return 0;
++	}
++
++	dev_err(&esoc_clink->dev, "Client hooks not registered for the device\n");
++	return -EINVAL;
++}
++
++static long esoc_dev_ioctl(struct file *file, unsigned int cmd,
++						unsigned long arg)
++{
++	int err;
++	u32 esoc_cmd, status, req, evt;
++	struct esoc_uhandle *uhandle = file->private_data;
++	struct esoc_udev *esoc_udev = uhandle->esoc_udev;
++	struct esoc_clink *esoc_clink = uhandle->esoc_clink;
++	const struct esoc_clink_ops * const clink_ops = esoc_clink->clink_ops;
++	void __user *uarg = (void __user *)arg;
++
++	switch (cmd) {
++	case ESOC_REG_REQ_ENG:
++		esoc_mdm_log("ESOC_REG_REQ_ENG\n");
++		err = esoc_clink_register_req_eng(esoc_clink, &uhandle->eng);
++		if (err) {
++			esoc_mdm_log("ESOC_REG_REQ_ENG failed: %d\n", err);
++			return err;
++		}
++		uhandle->req_eng_reg = true;
++		break;
++	case ESOC_REG_CMD_ENG:
++		esoc_mdm_log("ESOC_REG_CMD_ENG\n");
++		err = esoc_clink_register_cmd_eng(esoc_clink, &uhandle->eng);
++		if (err) {
++			esoc_mdm_log("ESOC_REG_CMD_ENG failed: %d\n", err);
++			return err;
++		}
++		uhandle->cmd_eng_reg = true;
++		break;
++	case ESOC_CMD_EXE:
++		if (esoc_clink->cmd_eng != &uhandle->eng) {
++			esoc_mdm_log("ESOC_CMD_EXE failed to access\n");
++			return -EACCES;
++		}
++		get_user(esoc_cmd, (u32 __user *)arg);
++		esoc_mdm_log("ESOC_CMD_EXE: Executing esoc command: %u\n", esoc_cmd);
++		return clink_ops->cmd_exe(esoc_cmd, esoc_clink);
++	case ESOC_WAIT_FOR_REQ:
++		if (esoc_clink->req_eng != &uhandle->eng) {
++			esoc_mdm_log("ESOC_WAIT_FOR_REQ: Failed to access\n");
++			return -EACCES;
++		}
++		esoc_mdm_log("ESOC_WAIT_FOR_REQ: Waiting for req event to arrive.\n");
++		err = wait_event_interruptible(esoc_udev->req_wait,
++					       !kfifo_is_empty(&esoc_udev->req_fifo));
++		if (!err) {
++			err = kfifo_out_spinlocked(&esoc_udev->req_fifo, &req, sizeof(req),
++						   &esoc_udev->req_fifo_lock);
++			if (err != sizeof(req)) {
++				esoc_mdm_log("ESOC_WAIT_FOR_REQ: Failed to read the event\n");
++				pr_err("read from clink %s req q failed\n", esoc_clink->name);
++				return -EIO;
++			}
++			put_user(req, (unsigned int __user *)uarg);
++			esoc_mdm_log("ESOC_WAIT_FOR_REQ: Event arrived: %u\n", req);
++
++		}
++		return err;
++	case ESOC_NOTIFY:
++		get_user(esoc_cmd, (u32 __user *)arg);
++		esoc_mdm_log("ESOC_NOTIFY: Notifying esoc about cmd: %u\n", esoc_cmd);
++		clink_ops->notify(esoc_cmd, esoc_clink);
++		break;
++	/*
++	 * These two are polled once a second for the lifetime of the system by
++	 * the request engine. Logging them at info level buries every other
++	 * message in the ring buffer, which is exactly the history needed when
++	 * something does go wrong, so keep them at debug.
++	 */
++	case ESOC_GET_STATUS:
++		clink_ops->get_status(&status, esoc_clink);
++		pr_debug("esoc-mdm: ESOC_GET_STATUS: Sending the status from esoc: %u\n",
++			 status);
++		put_user(status, (unsigned int __user *)uarg);
++		break;
++	case ESOC_GET_ERR_FATAL:
++		clink_ops->get_err_fatal(&status, esoc_clink);
++		pr_debug("esoc-mdm: ESOC_GET_ERR_FATAL: Sending err_fatal status from esoc: %u\n",
++			 status);
++		put_user(status, (unsigned int __user *)uarg);
++		break;
++	case ESOC_WAIT_FOR_CRASH:
++		esoc_mdm_log("ESOC_WAIT_FOR_CRASH: Waiting for evt to arrive..\n");
++		err = wait_event_interruptible(esoc_udev->evt_wait,
++					       !kfifo_is_empty(&esoc_udev->evt_fifo));
++		if (!err) {
++			err = kfifo_out_spinlocked(&esoc_udev->evt_fifo, &evt, sizeof(evt),
++						   &esoc_udev->evt_fifo_lock);
++			if (err != sizeof(evt)) {
++				esoc_mdm_log("ESOC_WAIT_FOR_CRASH: Failed to read event\n");
++				pr_err("read from clink %s evt q failed\n", esoc_clink->name);
++				return -EIO;
++			}
++			put_user(evt, (unsigned int __user *)uarg);
++			esoc_mdm_log("ESOC_WAIT_FOR_CRASH: Event arrived: %u\n", evt);
++		}
++		return err;
++	case ESOC_GET_LINK_ID:
++		return esoc_get_link_id(esoc_clink, arg);
++	case ESOC_SET_BOOT_FAIL_ACT:
++		get_user(esoc_cmd, (u32 __user *) arg);
++		return esoc_set_boot_fail_action(esoc_clink, esoc_cmd);
++	case ESOC_SET_N_PON_TRIES:
++		get_user(esoc_cmd, (u32 __user *) arg);
++		return esoc_set_n_pon_tries(esoc_clink, esoc_cmd);
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int esoc_dev_open(struct inode *inode, struct file *file)
++{
++	struct esoc_uhandle *uhandle;
++	struct esoc_udev *esoc_udev;
++	struct esoc_clink *esoc_clink;
++	struct esoc_eng *eng;
++	unsigned int minor = iminor(inode);
++
++	esoc_udev = esoc_udev_get_by_minor(minor);
++	if (!esoc_udev) {
++		esoc_mdm_log("failed to get udev\n");
++		pr_err("failed to get udev\n");
++		return -ENOMEM;
++	}
++
++	esoc_clink = get_esoc_clink(esoc_udev->clink->id);
++	if (!esoc_clink) {
++		esoc_mdm_log("failed to get clink\n");
++		pr_err("failed to get clink\n");
++		return -ENOMEM;
++	}
++
++	uhandle = kzalloc(sizeof(*uhandle), GFP_KERNEL);
++	if (!uhandle) {
++		put_esoc_clink(esoc_clink);
++		return -ENOMEM;
++	}
++	uhandle->esoc_udev = esoc_udev;
++	uhandle->esoc_clink = esoc_clink;
++	eng = &uhandle->eng;
++	eng->handle_clink_req = esoc_udev_handle_clink_req;
++	eng->handle_clink_evt = esoc_udev_handle_clink_evt;
++	file->private_data = uhandle;
++	esoc_mdm_log("%s successfully attached to esoc driver\n", current->comm);
++	return 0;
++}
++
++static int esoc_dev_release(struct inode *inode, struct file *file)
++{
++	struct esoc_clink *esoc_clink;
++	struct esoc_uhandle *uhandle = file->private_data;
++
++	esoc_clink = uhandle->esoc_clink;
++	if (uhandle->req_eng_reg) {
++		esoc_mdm_log("Unregistering req_eng\n");
++		esoc_clink_unregister_req_eng(esoc_clink, &uhandle->eng);
++	} else {
++		esoc_mdm_log("No req_eng to unregister\n");
++	}
++	if (uhandle->cmd_eng_reg) {
++		esoc_mdm_log("Unregistering cmd_eng\n");
++		esoc_clink_unregister_cmd_eng(esoc_clink, &uhandle->eng);
++	} else {
++		esoc_mdm_log("No cmd_eng to unregister\n");
++	}
++	uhandle->req_eng_reg = false;
++	uhandle->cmd_eng_reg = false;
++	put_esoc_clink(esoc_clink);
++	kfree(uhandle);
++	esoc_mdm_log("%s Unregistered with esoc\n", current->comm);
++	return 0;
++}
++static const struct file_operations esoc_dev_fops = {
++	.owner		= THIS_MODULE,
++	.open		= esoc_dev_open,
++	.unlocked_ioctl = esoc_dev_ioctl,
++	.release	= esoc_dev_release,
++};
++
++int esoc_clink_add_device(struct device *dev, void *dummy)
++{
++	struct esoc_udev *esoc_udev;
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++
++	esoc_udev = get_free_esoc_udev(esoc_clink);
++	if (IS_ERR_OR_NULL(esoc_udev))
++		return PTR_ERR(esoc_udev);
++	esoc_udev->dev = device_create(esoc_class, &esoc_clink->dev,
++				       MKDEV(esoc_major, esoc_clink->id),
++				       esoc_clink, "subsys_%s", esoc_clink->name);
++	if (IS_ERR_OR_NULL(esoc_udev->dev)) {
++		pr_err("failed to create user device\n");
++		goto dev_err;
++	}
++	return 0;
++dev_err:
++	return_esoc_udev(esoc_udev);
++	return -ENODEV;
++}
++
++int esoc_clink_del_device(struct device *dev, void *dummy)
++{
++	struct esoc_udev *esoc_udev;
++	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
++
++	esoc_udev = esoc_udev_get_by_minor(esoc_clink->id);
++	if (!esoc_udev)
++		return 0;
++	device_destroy(esoc_class, MKDEV(esoc_major, esoc_clink->id));
++	return_esoc_udev(esoc_udev);
++	return 0;
++}
++
++int esoc_dev_init(void)
++{
++	int ret = 0;
++
++	esoc_class = class_create("esoc-dev");
++	if (IS_ERR_OR_NULL(esoc_class)) {
++		pr_err("coudn't create class\n");
++		return PTR_ERR(esoc_class);
++	}
++	esoc_major = register_chrdev(0, "esoc", &esoc_dev_fops);
++	if (esoc_major < 0) {
++		pr_err("failed to allocate char dev\n");
++		ret = esoc_major;
++		goto class_unreg;
++	}
++	esoc_for_each_dev(NULL, esoc_clink_add_device);
++	return ret;
++class_unreg:
++	class_destroy(esoc_class);
++	return 0;
++}
++EXPORT_SYMBOL(esoc_dev_init);
++
++void esoc_dev_exit(void)
++{
++	class_destroy(esoc_class);
++	unregister_chrdev(esoc_major, "esoc");
++}
++EXPORT_SYMBOL(esoc_dev_exit);
++EXPORT_SYMBOL(esoc_clink_add_device);
++EXPORT_SYMBOL(esoc_clink_del_device);
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/remoteproc/mdm-dbg.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2015, 2018, 2020-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++static bool debug_init_done;
++
++#ifndef CONFIG_QCOM_ESOC_DBG_ENG
++
++static inline bool dbg_check_cmd_mask(unsigned int cmd)
++{
++	return false;
++}
++
++static inline bool dbg_check_notify_mask(unsigned int notify)
++{
++	return false;
++}
++
++static inline int mdm_dbg_eng_init(void)
++{
++	return 0;
++}
++
++static inline void mdm_dbg_eng_exit(void)
++{
++}
++
++#else
++extern bool dbg_check_cmd_mask(unsigned int cmd);
++extern bool dbg_check_notify_mask(unsigned int notify);
++extern int mdm_dbg_eng_init(void);
++extern void mdm_dbg_eng_exit(void);
++#endif
++
++#ifndef CONFIG_QCOM_ESOC_DBG_REQ_ENG
++static inline int register_dbg_req_eng(struct esoc_clink *clink)
++{
++	return 0;
++}
++static inline void unregister_dbg_req_eng(struct esoc_clink *clink)
++{
++}
++#else
++extern int register_dbg_req_eng(struct esoc_clink *clink);
++extern void unregister_dbg_req_eng(struct esoc_clink *clink);
++#endif
++
++static inline bool mdm_dbg_stall_cmd(unsigned int cmd)
++{
++	if (debug_init_done)
++		return dbg_check_cmd_mask(cmd);
++	else
++		return false;
++}
++
++static inline bool mdm_dbg_stall_notify(unsigned int notify)
++{
++	if (debug_init_done)
++		return dbg_check_notify_mask(notify);
++	else
++		return false;
++}
++
++
+--- /dev/null
++++ b/include/linux/esoc_client.h
+@@ -0,0 +1,81 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2014, 2017-2020, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#ifndef __ESOC_CLIENT_H_
++#define __ESOC_CLIENT_H_
++
++#include <linux/device.h>
++#include <linux/esoc_ctrl.h>
++#include <linux/notifier.h>
++
++/* Flag values used with the power_on and power_off hooks */
++#define ESOC_HOOK_MDM_CRASH	0x0001 /* In crash handling path */
++#define ESOC_HOOK_MDM_DOWN	0x0002 /* MDM about to go down */
++
++struct esoc_client_hook {
++	char *name;
++	void *priv;
++	enum esoc_client_hook_prio prio;
++	int (*esoc_link_power_on)(void *priv, unsigned int flags);
++	void (*esoc_link_power_off)(void *priv, unsigned int flags);
++	u64 (*esoc_link_get_id)(void *priv);
++	void (*esoc_link_mdm_crash)(void *priv);
++};
++
++/*
++ * struct esoc_desc: Describes an external soc
++ * @name: external soc name
++ * @priv: private data for external soc
++ */
++struct esoc_desc {
++	const char *name;
++	const char *link;
++	const char *link_info;
++	void *priv;
++};
++
++#if IS_ENABLED(CONFIG_QCOM_ESOC_CLIENT)
++/* Can return probe deferral */
++struct esoc_desc *devm_register_esoc_client(struct device *dev,
++							const char *name);
++void devm_unregister_esoc_client(struct device *dev,
++						struct esoc_desc *esoc_desc);
++int esoc_register_client_notifier(struct notifier_block *nb);
++int esoc_register_client_hook(struct esoc_desc *desc,
++				struct esoc_client_hook *client_hook);
++int esoc_unregister_client_hook(struct esoc_desc *desc,
++				struct esoc_client_hook *client_hook);
++
++#else
++struct esoc_desc *devm_register_esoc_client(struct device *dev,
++							const char *name)
++{
++	return NULL;
++}
++
++void devm_unregister_esoc_client(struct device *dev,
++						struct esoc_desc *esoc_desc)
++{
++}
++
++int esoc_register_client_notifier(struct notifier_block *nb)
++{
++	return -EPERM;
++}
++
++int esoc_register_client_hook(struct esoc_desc *desc,
++				struct esoc_client_hook *client_hook)
++{
++	return -EPERM;
++}
++
++int esoc_unregister_client_hook(struct esoc_desc *desc,
++				struct esoc_client_hook *client_hook)
++{
++	return -EPERM;
++}
++#endif
++#endif
+--- /dev/null
++++ b/include/linux/ipc_logging.h
+@@ -0,0 +1,287 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2012-2015,2017-2021 The Linux Foundation. All rights reserved.
++ */
++
++#ifndef _IPC_LOGGING_H
++#define _IPC_LOGGING_H
++
++#include <linux/errno.h>
++#include <linux/types.h>
++
++#define MAX_MSG_SIZE 255
++
++enum {
++	TSV_TYPE_MSG_START = 1,
++	TSV_TYPE_SKB = TSV_TYPE_MSG_START,
++	TSV_TYPE_STRING,
++	TSV_TYPE_MSG_END = TSV_TYPE_STRING,
++};
++
++struct tsv_header {
++	unsigned char type;
++	unsigned char size; /* size of data field */
++};
++
++struct encode_context {
++	struct tsv_header hdr;
++	char buff[MAX_MSG_SIZE];
++	int offset;
++};
++
++struct decode_context {
++	int output_format;      /* 0 = debugfs */
++	char *buff;             /* output buffer */
++	int size;               /* size of output buffer */
++};
++
++#if IS_ENABLED(CONFIG_IPC_LOGGING)
++/*
++ * ipc_log_context_create: Create a debug log context
++ *                         Should not be called from atomic context
++ *
++ * @max_num_pages: Number of pages of logging space required (max. 10)
++ * @mod_name     : Name of the directory entry under DEBUGFS
++ * @feature_version : First 16 bit for version number of user-defined message
++ *		      formats and next 16 bit for enabling minidump
++ *
++ * returns context id on success, NULL on failure
++ */
++void *ipc_log_context_create(int max_num_pages, const char *modname,
++		uint32_t feature_version);
++
++/*
++ * msg_encode_start: Start encoding a log message
++ *
++ * @ectxt: Temporary storage to hold the encoded message
++ * @type:  Root event type defined by the module which is logging
++ */
++void msg_encode_start(struct encode_context *ectxt, uint32_t type);
++
++/*
++ * tsv_timestamp_write: Writes the current timestamp count
++ *
++ * @ectxt: Context initialized by calling msg_encode_start()
++ */
++int tsv_timestamp_write(struct encode_context *ectxt);
++
++/*
++ * tsv_qtimer_write: Writes the current QTimer timestamp count
++ *
++ * @ectxt: Context initialized by calling msg_encode_start()
++ */
++int tsv_qtimer_write(struct encode_context *ectxt);
++
++/*
++ * tsv_pointer_write: Writes a data pointer
++ *
++ * @ectxt:   Context initialized by calling msg_encode_start()
++ * @pointer: Pointer value to write
++ */
++int tsv_pointer_write(struct encode_context *ectxt, void *pointer);
++
++/*
++ * tsv_int32_write: Writes a 32-bit integer value
++ *
++ * @ectxt: Context initialized by calling msg_encode_start()
++ * @n:     Integer to write
++ */
++int tsv_int32_write(struct encode_context *ectxt, int32_t n);
++
++/*
++ * tsv_byte_array_write: Writes a byte array
++ *
++ * @ectxt:     Context initialized by calling msg_encode_start()
++ * @data:      Pointer to byte array
++ * @data_size: Size of byte array
++ */
++int tsv_byte_array_write(struct encode_context *ectxt,
++			 void *data, int data_size);
++
++/*
++ * msg_encode_end: Complete the message encode process
++ *
++ * @ectxt: Temporary storage which holds the encoded message
++ */
++void msg_encode_end(struct encode_context *ectxt);
++
++/*
++ * ipc_log_write: Commits message to logging ring buffer
++ *
++ * @ctxt:  Logging context
++ * @ectxt: Temporary storage which holds the encoded message
++ */
++void ipc_log_write(void *ctxt, struct encode_context *ectxt);
++
++/*
++ * ipc_log_string: Helper function to log a string
++ *
++ * @ilctxt: Debug Log Context created using ipc_log_context_create()
++ * @fmt:    Data specified using format specifiers
++ */
++int ipc_log_string(void *ilctxt, const char *fmt, ...) __printf(2, 3);
++
++/**
++ * ipc_log_extract - Reads and deserializes log
++ *
++ * @ilctxt:  logging context
++ * @buff:    buffer to receive the data
++ * @size:    size of the buffer
++ * @returns: 0 if no data read; >0 number of bytes read; < 0 error
++ *
++ * If no data is available to be read, then the ilctxt::read_avail
++ * completion is reinitialized.  This allows clients to block
++ * until new log data is save.
++ */
++int ipc_log_extract(void *ilctxt, char *buff, int size);
++
++/*
++ * Print a string to decode context.
++ * @dctxt   Decode context
++ * @args   printf args
++ */
++#define IPC_SPRINTF_DECODE(dctxt, args...) \
++do { \
++	int i; \
++	i = scnprintf(dctxt->buff, dctxt->size, args); \
++	dctxt->buff += i; \
++	dctxt->size -= i; \
++} while (0)
++
++/*
++ * tsv_timestamp_read: Reads a timestamp
++ *
++ * @ectxt:  Context retrieved by reading from log space
++ * @dctxt:  Temporary storage to hold the decoded message
++ * @format: Output format while dumping through DEBUGFS
++ */
++void tsv_timestamp_read(struct encode_context *ectxt,
++			struct decode_context *dctxt, const char *format);
++
++/*
++ * tsv_qtimer_read: Reads a QTimer timestamp
++ *
++ * @ectxt:  Context retrieved by reading from log space
++ * @dctxt:  Temporary storage to hold the decoded message
++ * @format: Output format while dumping through DEBUGFS
++ */
++void tsv_qtimer_read(struct encode_context *ectxt,
++		     struct decode_context *dctxt, const char *format);
++
++/*
++ * tsv_pointer_read: Reads a data pointer
++ *
++ * @ectxt:  Context retrieved by reading from log space
++ * @dctxt:  Temporary storage to hold the decoded message
++ * @format: Output format while dumping through DEBUGFS
++ */
++void tsv_pointer_read(struct encode_context *ectxt,
++		      struct decode_context *dctxt, const char *format);
++
++/*
++ * tsv_int32_read: Reads a 32-bit integer value
++ *
++ * @ectxt:  Context retrieved by reading from log space
++ * @dctxt:  Temporary storage to hold the decoded message
++ * @format: Output format while dumping through DEBUGFS
++ */
++int32_t tsv_int32_read(struct encode_context *ectxt,
++		       struct decode_context *dctxt, const char *format);
++
++/*
++ * tsv_byte_array_read: Reads a byte array
++ *
++ * @ectxt:  Context retrieved by reading from log space
++ * @dctxt:  Temporary storage to hold the decoded message
++ * @format: Output format while dumping through DEBUGFS
++ */
++void tsv_byte_array_read(struct encode_context *ectxt,
++			 struct decode_context *dctxt, const char *format);
++
++/*
++ * add_deserialization_func: Register a deserialization function to
++ *                           unpack the subevents of a main event
++ *
++ * @ctxt: Debug log context to which the deserialization function has
++ *        to be registered
++ * @type: Main/Root event, defined by the module which is logging, to
++ *        which this deserialization function has to be registered.
++ * @dfune: Deserialization function to be registered
++ *
++ * return 0 on success, -ve value on FAILURE
++ */
++int add_deserialization_func(void *ctxt, int type,
++			void (*dfunc)(struct encode_context *,
++				      struct decode_context *));
++
++/*
++ * ipc_log_context_destroy: Destroy debug log context
++ *
++ * @ctxt: debug log context created by calling ipc_log_context_create API.
++ */
++int ipc_log_context_destroy(void *ctxt);
++
++#else
++
++static inline void *ipc_log_context_create(int max_num_pages,
++	const char *modname, uint32_t feature_version)
++{ return NULL; }
++
++static inline void msg_encode_start(struct encode_context *ectxt,
++	uint32_t type) { }
++
++static inline int tsv_timestamp_write(struct encode_context *ectxt)
++{ return -EINVAL; }
++
++static inline int tsv_qtimer_write(struct encode_context *ectxt)
++{ return -EINVAL; }
++
++static inline int tsv_pointer_write(struct encode_context *ectxt, void *pointer)
++{ return -EINVAL; }
++
++static inline int tsv_int32_write(struct encode_context *ectxt, int32_t n)
++{ return -EINVAL; }
++
++static inline int tsv_byte_array_write(struct encode_context *ectxt,
++			 void *data, int data_size)
++{ return -EINVAL; }
++
++static inline void msg_encode_end(struct encode_context *ectxt) { }
++
++static inline void ipc_log_write(void *ctxt, struct encode_context *ectxt) { }
++
++static inline int ipc_log_string(void *ilctxt, const char *fmt, ...)
++{ return -EINVAL; }
++
++static inline int ipc_log_extract(void *ilctxt, char *buff, int size)
++{ return -EINVAL; }
++
++#define IPC_SPRINTF_DECODE(dctxt, args...) do { } while (0)
++
++static inline void tsv_timestamp_read(struct encode_context *ectxt,
++			struct decode_context *dctxt, const char *format) { }
++
++static inline void tsv_qtimer_read(struct encode_context *ectxt,
++			struct decode_context *dctxt, const char *format) { }
++
++static inline void tsv_pointer_read(struct encode_context *ectxt,
++		      struct decode_context *dctxt, const char *format) { }
++
++static inline int32_t tsv_int32_read(struct encode_context *ectxt,
++		       struct decode_context *dctxt, const char *format)
++{ return 0; }
++
++static inline void tsv_byte_array_read(struct encode_context *ectxt,
++			 struct decode_context *dctxt, const char *format) { }
++
++static inline int add_deserialization_func(void *ctxt, int type,
++			void (*dfunc)(struct encode_context *,
++				      struct decode_context *))
++{ return 0; }
++
++static inline int ipc_log_context_destroy(void *ctxt)
++{ return 0; }
++
++#endif
++
++#endif
+--- /dev/null
++++ b/include/linux/of_gpio.h
+@@ -0,0 +1,90 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * OF helpers for the GPIO API
++ *
++ * Copyright (c) 2007-2008  MontaVista Software, Inc.
++ *
++ * Author: Anton Vorontsov <avorontsov@ru.mvista.com>
++ */
++
++#ifndef __LINUX_OF_GPIO_H
++#define __LINUX_OF_GPIO_H
++
++#include <linux/compiler.h>
++#include <linux/gpio/driver.h>
++#include <linux/gpio.h>		/* FIXME: Shouldn't be here */
++#include <linux/of.h>
++
++struct device_node;
++
++/*
++ * This is Linux-specific flags. By default controllers' and Linux' mapping
++ * match, but GPIO controllers are free to translate their own flags to
++ * Linux-specific in their .xlate callback. Though, 1:1 mapping is recommended.
++ */
++enum of_gpio_flags {
++	OF_GPIO_ACTIVE_LOW = 0x1,
++	OF_GPIO_SINGLE_ENDED = 0x2,
++	OF_GPIO_OPEN_DRAIN = 0x4,
++	OF_GPIO_TRANSITORY = 0x8,
++	OF_GPIO_PULL_UP = 0x10,
++	OF_GPIO_PULL_DOWN = 0x20,
++	OF_GPIO_PULL_DISABLE = 0x40,
++};
++
++#ifdef CONFIG_OF_GPIO
++
++extern int of_get_named_gpio_flags(const struct device_node *np,
++		const char *list_name, int index, enum of_gpio_flags *flags);
++
++#else /* CONFIG_OF_GPIO */
++
++#include <linux/errno.h>
++
++/* Drivers may not strictly depend on the GPIO support, so let them link. */
++static inline int of_get_named_gpio_flags(const struct device_node *np,
++		const char *list_name, int index, enum of_gpio_flags *flags)
++{
++	if (flags)
++		*flags = 0;
++
++	return -ENOSYS;
++}
++
++#endif /* CONFIG_OF_GPIO */
++
++/**
++ * of_get_named_gpio() - Get a GPIO number to use with the legacy GPIO API
++ * @np:		device node to get GPIO from
++ * @propname:	Name of property containing gpio specifier(s)
++ * @index:	index of the GPIO
++ *
++ * Returns GPIO number to use with Linux generic GPIO API, or one of the errno
++ * value on the error condition.
++ */
++static inline int of_get_named_gpio(const struct device_node *np,
++				    const char *propname, int index)
++{
++	return of_get_named_gpio_flags(np, propname, index, NULL);
++}
++
++static inline int of_get_gpio_flags(const struct device_node *np, int index,
++		      enum of_gpio_flags *flags)
++{
++	return of_get_named_gpio_flags(np, "gpios", index, flags);
++}
++
++/**
++ * of_get_gpio() - Get a GPIO number to use with GPIO API
++ * @np:		device node to get GPIO from
++ * @index:	index of the GPIO
++ *
++ * Returns GPIO number to use with Linux generic GPIO API, or one of the errno
++ * value on the error condition.
++ */
++static inline int of_get_gpio(const struct device_node *np, int index)
++{
++	return of_get_gpio_flags(np, index, NULL);
++}
++
++#endif /* __LINUX_OF_GPIO_H */
+--- /dev/null
++++ b/include/uapi/linux/esoc_ctrl.h
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/*
++ * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#ifndef _UAPI_ESOC_CTRL_H_
++#define _UAPI_ESOC_CTRL_H_
++
++#include <linux/types.h>
++
++enum esoc_client_hook_prio {
++	ESOC_MHI_HOOK,
++	ESOC_MAX_HOOKS
++};
++
++struct esoc_link_data {
++	enum esoc_client_hook_prio prio;
++	__u64 link_id;
++};
++
++#define ESOC_CODE		0xCC
++
++#define ESOC_CMD_EXE		_IOW(ESOC_CODE, 1, unsigned int)
++#define ESOC_WAIT_FOR_REQ	_IOR(ESOC_CODE, 2, unsigned int)
++#define ESOC_NOTIFY		_IOW(ESOC_CODE, 3, unsigned int)
++#define ESOC_GET_STATUS		_IOR(ESOC_CODE, 4, unsigned int)
++#define ESOC_GET_ERR_FATAL	_IOR(ESOC_CODE, 5, unsigned int)
++#define ESOC_WAIT_FOR_CRASH	_IOR(ESOC_CODE, 6, unsigned int)
++#define ESOC_REG_REQ_ENG	_IO(ESOC_CODE, 7)
++#define ESOC_REG_CMD_ENG	_IO(ESOC_CODE, 8)
++#define ESOC_GET_LINK_ID	_IOWR(ESOC_CODE, 9, struct esoc_link_data)
++#define ESOC_SET_BOOT_FAIL_ACT	_IOW(ESOC_CODE, 10, unsigned int)
++#define ESOC_SET_N_PON_TRIES	_IOW(ESOC_CODE, 11, unsigned int)
++
++#define ESOC_REQ_SEND_SHUTDOWN	ESOC_REQ_SEND_SHUTDOWN
++#define ESOC_REQ_CRASH_SHUTDOWN ESOC_REQ_CRASH_SHUTDOWN
++#define ESOC_PON_RETRY		ESOC_PON_RETRY
++#define ESOC_BOOT_FAIL_ACTION
++
++enum esoc_boot_fail_action {
++	BOOT_FAIL_ACTION_RETRY,
++	BOOT_FAIL_ACTION_COLD_RESET,
++	BOOT_FAIL_ACTION_SHUTDOWN,
++	BOOT_FAIL_ACTION_PANIC,
++	BOOT_FAIL_ACTION_NOP,
++	BOOT_FAIL_ACTION_S3_RESET,
++	BOOT_FAIL_ACTION_LAST,
++};
++
++enum esoc_evt {
++	ESOC_RUN_STATE = 0x1,
++	ESOC_UNEXPECTED_RESET,
++	ESOC_ERR_FATAL,
++	ESOC_IN_DEBUG,
++	ESOC_REQ_ENG_ON,
++	ESOC_REQ_ENG_OFF,
++	ESOC_CMD_ENG_ON,
++	ESOC_CMD_ENG_OFF,
++	ESOC_INVALID_STATE,
++	ESOC_RETRY_PON_EVT,
++	ESOC_BOOT_STATE,
++};
++
++enum esoc_cmd {
++	ESOC_PWR_ON = 1,
++	ESOC_PWR_OFF,
++	ESOC_FORCE_PWR_OFF,
++	ESOC_RESET,
++	ESOC_PREPARE_DEBUG,
++	ESOC_EXE_DEBUG,
++	ESOC_EXIT_DEBUG,
++};
++
++enum esoc_notify {
++	ESOC_IMG_XFER_DONE = 1,
++	ESOC_BOOT_DONE,
++	ESOC_BOOT_FAIL,
++	ESOC_IMG_XFER_RETRY,
++	ESOC_IMG_XFER_FAIL,
++	ESOC_UPGRADE_AVAILABLE,
++	ESOC_DEBUG_DONE,
++	ESOC_DEBUG_FAIL,
++	ESOC_PRIMARY_CRASH,
++	ESOC_PRIMARY_REBOOT,
++	ESOC_PON_RETRY,
++};
++
++enum esoc_req {
++	ESOC_REQ_IMG = 1,
++	ESOC_REQ_DEBUG,
++	ESOC_REQ_SHUTDOWN,
++	ESOC_REQ_SEND_SHUTDOWN,
++	ESOC_REQ_CRASH_SHUTDOWN,
++};
++
++#endif

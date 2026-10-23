@@ -1,0 +1,17 @@
+# Modem services the SDX55 expects from the AP; without them it never leaves SBL.
+enable pm-service-native.service
+enable mdm-helper-native.service
+
+# The modem's remote filesystem: tqftpserv patched to publish QRTR instance 3.
+enable tqftpserv-sdx55.service
+
+# EFS: extract this device's NV from its partitions on first boot...
+enable umi-efs-extract.service
+# ...and mirror the modem's remote EFS (Sahara memory-debug channel).
+enable mhi-efs-sync.service
+
+# Select the USIM application before ModemManager probes (QRTR node 3).
+enable umi-uim-provision.service
+
+# ModemManager starts before the modem exists; this looks again once it does.
+enable ModemManager-restart-once.service

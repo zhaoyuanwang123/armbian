@@ -1,0 +1,7 @@
+# SDX55 fusion modem on PCIe: control plane is QRTR over IPCR, data plane is
+# mhi_net, EFS mirror needs the wwan ctrl driver, bearers want rmnet (QMAP).
+qrtr
+qrtr-mhi
+mhi_wwan_ctrl
+mhi_net
+rmnet

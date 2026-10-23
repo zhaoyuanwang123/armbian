@@ -1,0 +1,24 @@
+[Unit]
+Description=Start the SDX55 ESOC modem remoteproc (drives ESOC_PWR_ON)
+# The esoc remoteproc (remoteproc whose firmware is qcom/sdx55m/sbl1.mbn) is
+# the power-on entry: rproc start -> ESOC_PWR_ON -> AP2MDM handshake (answered
+# by mdm-helper-native) -> AP2MDM_STATUS high -> MHI hook fires -> BHI/Sahara
+# -> mission mode. The helper must already be watching, and tqftpserv must be
+# publishing before the modem reaches RFS (mcfg) load.
+After=mdm-helper-native.service tqftpserv-sdx55.service
+Wants=mdm-helper-native.service
+ConditionPathExists=/sys/kernel/debug/esoc_mdm_dbg_eng
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Find the remoteproc bound to the SDX55 firmware and start it. Retry a few
+# times: the rproc start waits for the ESOC request engine which registers
+# early at boot; failures here are typically transient (fw load, SMMU).
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5; do for r in /sys/class/remoteproc/remoteproc*; do [ -r "$r/firmware" ] || continue; grep -q sdx55m "$r/firmware" 2>/dev/null || continue; echo start > "$r/state" 2>/dev/null && exit 0; done; sleep 5; done; exit 1'
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

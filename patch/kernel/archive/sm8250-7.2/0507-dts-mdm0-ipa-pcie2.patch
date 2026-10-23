@@ -1,0 +1,322 @@
+From: Zhao_Wang <umi@xiaomi>
+Subject: [PATCH] arm64: dts: qcom: sm8250/pm8150(x): mdm0 (ext-sdx55m), IPA, pcie2_rp nodes
+
+Xiaomi Mi 10 (umi): DT nodes for the SDX55m external modem —
+mdm0 (qcom,ext-sdx55m) ESOC node, IPA v4.5 node, pcie2 root port
+(pcie2_rp) with interconnects, pm8150(x) modem regulator additions.
+Ported from the Mi 10T pmOS kernel set onto 7.2.11.
+pm8150b charger/fuel-gauge nodes deduplicated against the existing
+power patches (0024/0025/0028/0042).
+
+Signed-off-by: Zhao_Wang <umi@xiaomi>
+---
+diff --git a/arch/arm64/boot/dts/qcom/pm8150.dtsi b/arch/arm64/boot/dts/qcom/pm8150.dtsi
+index d2568686a..19f14b6c7 100644
+--- a/arch/arm64/boot/dts/qcom/pm8150.dtsi
++++ b/arch/arm64/boot/dts/qcom/pm8150.dtsi
+@@ -123,6 +123,15 @@ rtc@6000 {
+ 			interrupts = <0x0 0x61 0x1 IRQ_TYPE_NONE>;
+ 		};
+ 
++		pm8150_sdam_2: nvram@b100 {
++			compatible = "qcom,spmi-sdam";
++			reg = <0xb100>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges = <0 0xb100 0x100>;
++			status = "disabled";
++		};
++
+ 		pm8150_gpios: gpio@c000 {
+ 			compatible = "qcom,pm8150-gpio", "qcom,spmi-gpio";
+ 			reg = <0xc000>;
+diff --git a/arch/arm64/boot/dts/qcom/pm8150b.dtsi b/arch/arm64/boot/dts/qcom/pm8150b.dtsi
+index 19391f433..58c3a4cfd 100644
+--- a/arch/arm64/boot/dts/qcom/pm8150b.dtsi
++++ b/arch/arm64/boot/dts/qcom/pm8150b.dtsi
+@@ -165,6 +165,18 @@ channel@6 {
+ 				label = "die_temp";
+ 			};
+ 
++			channel@7 {
++				reg = <ADC5_USB_IN_I>;
++				qcom,pre-scaling = <1 1>;
++				label = "usb_in_i_uv";
++			};
++
++			channel@8 {
++				reg = <ADC5_USB_IN_V_16>;
++				qcom,pre-scaling = <1 16>;
++				label = "usb_in_v_div_16";
++			};
++
+ 			channel@9 {
+ 				reg = <ADC5_CHG_TEMP>;
+ 				qcom,pre-scaling = <1 1>;
+diff --git a/arch/arm64/boot/dts/qcom/pm8150l.dtsi b/arch/arm64/boot/dts/qcom/pm8150l.dtsi
+index 3911d6d0d..d287adac7 100644
+--- a/arch/arm64/boot/dts/qcom/pm8150l.dtsi
++++ b/arch/arm64/boot/dts/qcom/pm8150l.dtsi
+@@ -115,6 +115,36 @@ pmic@5 {
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
++		pm8150l_lcdb: qcom,lcdb@ec00 {
++			compatible = "qcom,qpnp-lcdb-regulator";
++			reg = <0xec00 0x100>;
++			interrupts = <0x5 0xec 0x1 IRQ_TYPE_EDGE_RISING>;
++			interrupt-names = "sc-irq";
++			//qcom,voltage-step-ramp;
++			status = "disabled";
++
++			lcdb_ldo_vreg: ldo {
++				label = "ldo";
++				regulator-name = "lcdb_ldo";
++				regulator-min-microvolt = <4000000>;
++				regulator-max-microvolt = <6000000>;
++			};
++
++			lcdb_ncp_vreg: ncp {
++				label = "ncp";
++				regulator-name = "lcdb_ncp";
++				regulator-min-microvolt = <4000000>;
++				regulator-max-microvolt = <6000000>;
++			};
++
++			lcdb_bst_vreg: bst {
++				label = "bst";
++				regulator-name = "lcdb_bst";
++				regulator-min-microvolt = <4700000>;
++				regulator-max-microvolt = <6275000>;
++			};
++		};
++
+ 		pm8150l_flash: led-controller@d300 {
+ 			compatible = "qcom,pm8150l-flash-led", "qcom,spmi-flash-led";
+ 			reg = <0xd300>;
+diff --git a/arch/arm64/boot/dts/qcom/sm8250.dtsi b/arch/arm64/boot/dts/qcom/sm8250.dtsi
+index 809392550..715b2c800 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8250.dtsi
+@@ -23,6 +23,7 @@
+ #include <dt-bindings/thermal/thermal.h>
+ #include <dt-bindings/clock/qcom,camcc-sm8250.h>
+ #include <dt-bindings/clock/qcom,videocc-sm8250.h>
++#include <dt-bindings/interconnect/qcom,sm8250.h>
+ 
+ / {
+ 	interrupt-parent = <&intc>;
+@@ -941,6 +942,17 @@ smp2p_slpi_in: slave-kernel {
+ 			interrupt-controller;
+ 			#interrupt-cells = <2>;
+ 		};
++
++		sleepstate_smp2p_out: sleepstate-out {
++			qcom,entry-name = "sleepstate";
++			#qcom,smem-state-cells = <1>;
++		};
++
++		sleepstate_smp2p_in: sleepstate-in {
++			qcom,entry-name = "sleepstate_see";
++			interrupt-controller;
++			#interrupt-cells = <2>;
++		};
+ 	};
+ 
+ 	soc: soc@0 {
+@@ -2337,7 +2349,7 @@ pcie1: pcie@1c08000 {
+ 
+ 			status = "disabled";
+ 
+-			pcie@0 {
++			pcieport1: pcie@0 {
+ 				device_type = "pci";
+ 				reg = <0x0 0x0 0x0 0x0 0x0>;
+ 				bus-range = <0x01 0xff>;
+@@ -2462,9 +2474,13 @@ pcie2: pcie@1c10000 {
+ 			pinctrl-0 = <&pcie2_default_state>;
+ 			dma-coherent;
+ 
++			interconnects = <&aggre1_noc MASTER_PCIE_2 0 &mc_virt SLAVE_EBI_CH0 0>,
++					<&gem_noc MASTER_AMPSS_M0 0 &config_noc SLAVE_PCIE_2_CFG 0>;
++			interconnect-names = "pcie-mem", "cpu-pcie";
++
+ 			status = "disabled";
+ 
+-			pcieport2: pcie@0 {
++			pcie2_rp: pcie@0 {
+ 				device_type = "pci";
+ 				reg = <0x0 0x0 0x0 0x0 0x0>;
+ 				bus-range = <0x01 0xff>;
+@@ -2629,6 +2645,36 @@ crypto: crypto@1dfa000 {
+ 			interconnect-names = "memory";
+ 		};
+ 
++		ipa: ipa@1e40000 {
++			compatible = "qcom,sm8250-ipa";
++
++			iommus = <&apps_smmu 0x5c0 0x0>,
++				 <&apps_smmu 0x5c2 0x0>;
++			reg = <0 0x01e40000 0 0x8000>,
++			      <0 0x01e50000 0 0x4b20>,
++			      <0 0x01e04000 0 0x23000>;
++			reg-names = "ipa-reg",
++				    "ipa-shared",
++				    "gsi";
++
++			interrupts-extended = <&intc GIC_SPI 311 IRQ_TYPE_LEVEL_HIGH>, // was EDGE_RISING
++					      <&intc GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "ipa",
++					  "gsi";
++
++			clocks = <&rpmhcc RPMH_IPA_CLK>;
++			clock-names = "core";
++
++			interconnects = <&aggre2_noc MASTER_IPA 0 &mc_virt SLAVE_EBI_CH0 0>,
++					<&aggre2_noc MASTER_IPA 0 &system_noc SLAVE_OCIMEM 0>,
++					<&gem_noc MASTER_AMPSS_M0 0 &config_noc SLAVE_IPA_CFG 0>;
++			interconnect-names = "memory", "imem", "config";
++
++			qcom,qmp = <&aoss_qmp>;
++
++			status = "disabled";
++		};
++
+ 		tcsr_mutex: hwlock@1f40000 {
+ 			compatible = "qcom,tcsr-mutex";
+ 			reg = <0x0 0x01f40000 0x0 0x40000>;
+@@ -5140,6 +5186,34 @@ tlmm: pinctrl@f100000 {
+ 			gpio-ranges = <&tlmm 0 0 181>;
+ 			wakeup-parent = <&pdc>;
+ 
++			ap2mdm_active: ap2mdm-default-state {
++				pins = "gpio56", "gpio57";
++				function = "gpio";
++				drive-strength = <16>;
++				bias-disable;
++			};
++
++			ap2mdm_sleep: ap2mdm-sleep-state {
++				pins = "gpio56", "gpio57";
++				function = "gpio";
++				drive-strength = <8>;
++				bias-disable;
++			};
++
++			mdm2ap_active: mdm2ap-default-state {
++				pins = "gpio1", "gpio3";
++				function = "gpio";
++				drive-strength = <8>;
++				bias-disable;
++			};
++
++			mdm2ap_sleep: mdm2ap-sleep-state {
++				pins = "gpio1", "gpio3";
++				function = "gpio";
++				drive-strength = <8>;
++				bias-disable;
++			};
++
+ 			cam2_default: cam2-default-state {
+ 				rst-pins {
+ 					pins = "gpio78";
+@@ -5173,6 +5247,27 @@ mclk-pins {
+ 				};
+ 			};
+ 
++			cam_mclk0_default: cam-mclk0-default-state {
++				pins = "gpio94";
++				function = "cam_mclk";
++				drive-strength = <4>;
++				bias-disable;
++			};
++
++			cam_mclk1_default: cam-mclk1-default-state {
++				pins = "gpio95";
++				function = "cam_mclk";
++				drive-strength = <4>;
++				bias-disable;
++			};
++
++			cam_mclk3_default: cam-mclk3-default-state {
++				pins = "gpio97";
++				function = "cam_mclk";
++				drive-strength = <4>;
++				bias-disable;
++			};
++
+ 			cci0_default: cci0-default-state {
+ 				cci0_i2c0_default: cci0-i2c0-default-pins {
+ 					/* SDA, SCL */
+@@ -6079,6 +6174,28 @@ q6routing: routing {
+ 							#sound-dai-cells = <0>;
+ 						};
+ 					};
++
++					q6mvm: service@9 {
++						compatible = "qcom,q6mvm";
++						reg = <APR_SVC_ADSP_MVM>;
++						qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
++						q6voicedai: dais {
++							compatible = "qcom,q6voice-dais";
++							#sound-dai-cells = <0>;
++						};
++					};
++
++					q6cvs: service@a {
++						compatible = "qcom,q6cvs";
++						reg = <APR_SVC_ADSP_CVS>;
++						qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
++					};
++
++					q6cvp: service@b {
++						compatible = "qcom,q6cvp";
++						reg = <APR_SVC_ADSP_CVP>;
++						qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
++					};
+ 				};
+ 
+ 				fastrpc {
+@@ -6291,6 +6408,42 @@ cpufreq_hw: cpufreq@18591000 {
+ 			#freq-domain-cells = <1>;
+ 			#clock-cells = <1>;
+ 		};
++
++		mdm0: qcom,mdm0 {
++			compatible = "qcom,ext-sdx55m";
++			cell-index = <0>;
++			#address-cells = <0>;
++			interrupt-parent = <&mdm0>;
++			#interrupt-cells = <1>;
++			interrupt-map-mask = <0xffffffff>;
++			interrupt-names =
++				"err_fatal_irq",
++				"status_irq",
++				"mdm2ap_vddmin_irq";
++			/* modem attributes */
++			qcom,ramdump-delay-ms = <3000>;
++			qcom,ramdump-timeout-ms = <120000>;
++			qcom,vddmin-modes = "normal";
++			qcom,vddmin-drive-strength = <8>;
++			qcom,sfr-query;
++			qcom,sysmon-id = <20>;
++			qcom,ssctl-instance-id = <0x10>;
++			qcom,support-shutdown;
++			qcom,pil-force-shutdown;
++			qcom,esoc-skip-restart-for-mdm-crash;
++			qcom,ignore-ssr-failure;
++			pinctrl-names = "mdm_active", "mdm_suspend";
++			pinctrl-0 = <&ap2mdm_active &mdm2ap_active>;
++			pinctrl-1 = <&ap2mdm_sleep &mdm2ap_sleep>;
++			interrupt-map = <0 &tlmm 1 0x3
++					1 &tlmm 3 0x3>;
++			qcom,mdm2ap-errfatal-gpio = <&tlmm 1 0x00>;
++			qcom,ap2mdm-errfatal-gpio = <&tlmm 57 0x00>;
++			qcom,mdm2ap-status-gpio   = <&tlmm 3 0x00>;
++			qcom,ap2mdm-status-gpio   = <&tlmm 56 0x00>;
++			qcom,mdm-link-info = "0306_02.01.00";
++			status = "disabled";
++		};
+ 	};
+ 
+ 	sound: sound {

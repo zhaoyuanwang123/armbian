@@ -1,0 +1,314 @@
+From: Zhao_Wang <umi@xiaomi>
+Subject: [PATCH] firmware/soc: qcom_scm hyp_assign + pdr/pd-mapper/sleepstate modem glue
+
+Xiaomi Mi 10 (umi): firmware/soc: qcom_scm hyp_assign + pdr/pd-mapper/sleepstate modem glue — ported from the Mi 10T pmOS
+kernel set onto 7.2.11; naming unified to umi. Part of the
+SDX55m external modem (mobile data) bring-up.
+
+Signed-off-by: Zhao_Wang <umi@xiaomi>
+---
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -1170,6 +1170,42 @@
+ 	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
+ }
+ EXPORT_SYMBOL_GPL(qcom_scm_io_writel);
++
++/*
++ * Ask TZ to halt the SPMI PMIC arbiter. Dropping PS_HOLD in the middle
++ * of an SPMI transaction hangs the PMIC's PBS sequencer on some chips
++ * (the fault poweroff reason is PBS_WATCHDOG_TO), so a reset path must
++ * quiesce the arbiter first. After this call SPMI is gone for good -
++ * only useful on the way down.
++ */
++int qcom_scm_spmi_pmic_arbiter_halt(void)
++{
++	struct qcom_scm_desc desc = {
++		.svc = QCOM_SCM_SVC_PWR,
++		.cmd = QCOM_SCM_PWR_IO_DISABLE_PMIC_ARBITER,
++		.arginfo = QCOM_SCM_ARGS(1),
++		.args[0] = 0,
++		.owner = ARM_SMCCC_OWNER_SIP,
++	};
++
++	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
++}
++EXPORT_SYMBOL_GPL(qcom_scm_spmi_pmic_arbiter_halt);
++
++/* TZ-mediated PS_HOLD drop; may simply return on firmwares without it. */
++int qcom_scm_deassert_ps_hold(void)
++{
++	struct qcom_scm_desc desc = {
++		.svc = QCOM_SCM_SVC_PWR,
++		.cmd = QCOM_SCM_PWR_IO_DEASSERT_PS_HOLD,
++		.arginfo = QCOM_SCM_ARGS(1),
++		.args[0] = 0,
++		.owner = ARM_SMCCC_OWNER_SIP,
++	};
++
++	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
++}
++EXPORT_SYMBOL_GPL(qcom_scm_deassert_ps_hold);
+ 
+ /**
+  * qcom_scm_restore_sec_cfg_available() - Check if secure environment
+--- a/drivers/firmware/qcom/qcom_scm.h
++++ b/drivers/firmware/qcom/qcom_scm.h
+@@ -112,6 +112,10 @@
+ #define QCOM_SCM_IO_WRITE		0x02
+ 
+ #define QCOM_SCM_SVC_INFO		0x06
++
++#define QCOM_SCM_SVC_PWR		0x09
++#define QCOM_SCM_PWR_IO_DISABLE_PMIC_ARBITER	0x01
++#define QCOM_SCM_PWR_IO_DEASSERT_PS_HOLD	0x02
+ #define QCOM_SCM_INFO_IS_CALL_AVAIL	0x01
+ 
+ #define QCOM_SCM_SVC_MP				0x0c
+--- a/drivers/soc/qcom/Kconfig
++++ b/drivers/soc/qcom/Kconfig
+@@ -198,6 +198,14 @@
+ 
+ config QCOM_SMEM_STATE
+ 	bool
++
++config QCOM_SMP2P_SLEEPSTATE
++	tristate "Qualcomm SMP2P sleep state notifier"
++	depends on QCOM_SMP2P
++	help
++	  Notify remote processors over SMP2P whether the application
++	  processor is awake. Some DSP firmware, such as the SM8250
++	  sensor DSP, faults across a suspend cycle without it.
+ 
+ config QCOM_SMP2P
+ 	tristate "Qualcomm Shared Memory Point to Point support"
+--- a/drivers/soc/qcom/Makefile
++++ b/drivers/soc/qcom/Makefile
+@@ -27,6 +27,7 @@
+ obj-$(CONFIG_QCOM_SMEM_STATE) += smem_state.o
+ CFLAGS_smp2p.o := -I$(src)
+ obj-$(CONFIG_QCOM_SMP2P)	+= smp2p.o
++obj-$(CONFIG_QCOM_SMP2P_SLEEPSTATE)	+= smp2p-sleepstate.o
+ obj-$(CONFIG_QCOM_SMSM)	+= smsm.o
+ obj-$(CONFIG_QCOM_SOCINFO)	+= socinfo.o
+ obj-$(CONFIG_QCOM_SPM)		+= spm.o
+--- a/drivers/soc/qcom/pdr_interface.c
++++ b/drivers/soc/qcom/pdr_interface.c
+@@ -76,6 +76,18 @@
+ 	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
+ 					      locator_hdl);
+ 
++	if (svc->service != QMI_SERVICE_ID_SERVREG_LOC ||
++	    svc->version != 1 || svc->instance != 1) {
++		pr_info("PDR: ignoring non-locator server service=%u version=%u instance=%u node=%u port=%u\n",
++			svc->service, svc->version, svc->instance,
++			svc->node, svc->port);
++		return 0;
++	}
++
++	pr_info("PDR: locator server service=%u version=%u instance=%u node=%u port=%u\n",
++		svc->service, svc->version, svc->instance,
++		svc->node, svc->port);
++
+ 	mutex_lock(&pdr->lock);
+ 	/* Create a local client port for QMI communication */
+ 	pdr->locator_addr.sq_family = AF_QIPCRTR;
+@@ -96,6 +108,14 @@
+ {
+ 	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
+ 					      locator_hdl);
++
++	if (svc->service != QMI_SERVICE_ID_SERVREG_LOC ||
++	    svc->version != 1 || svc->instance != 1) {
++		pr_info("PDR: ignoring non-locator del_server service=%u version=%u instance=%u node=%u port=%u\n",
++			svc->service, svc->version, svc->instance,
++			svc->node, svc->port);
++		return;
++	}
+ 
+ 	mutex_lock(&pdr->lock);
+ 	pdr->locator_init_complete = false;
+@@ -361,6 +381,9 @@
+ 		return ret;
+ 
+ 	mutex_lock(&pdr->lock);
++	pr_info("PDR: get_domain_list service=\"%s\" offset_valid=%u offset=%u dst=%u:%u\n",
++		req->service_name, req->domain_offset_valid, req->domain_offset,
++		pdr->locator_addr.sq_node, pdr->locator_addr.sq_port);
+ 	ret = qmi_send_request(&pdr->locator_hdl,
+ 			       &pdr->locator_addr,
+ 			       &txn, SERVREG_GET_DOMAIN_LIST_REQ,
+--- a/drivers/soc/qcom/qcom_pd_mapper.c
++++ b/drivers/soc/qcom/qcom_pd_mapper.c
+@@ -644,12 +644,27 @@
+ {
+ 	const struct qcom_pdm_domain_data * const *domains;
+ 	const struct of_device_id *match;
++	struct device_node *ext_mdm;
+ 	struct qcom_pdm_data *data;
+ 	int ret, i;
+ 
+ 	match = of_machine_get_match(qcom_pdm_domains);
+ 	if (!match) {
+ 		pr_notice("PDM: no support for the platform, userspace daemon might be required.\n");
++		return ERR_PTR(-ENODEV);
++	}
++
++	/*
++	 * Fusion platforms with an external PCIe modem use vendor userspace
++	 * pd-mapper to expose modem-specific protection domains. The generic
++	 * in-kernel sm8250 table does not describe those modem PDs, so serving
++	 * locator requests here can hide the userspace mapper and return
++	 * incomplete domain lists to the modem.
++	 */
++	ext_mdm = of_find_compatible_node(NULL, NULL, "qcom,ext-sdx55m");
++	if (ext_mdm) {
++		of_node_put(ext_mdm);
++		pr_notice("PDM: external modem platform detected, deferring to userspace pd-mapper.\n");
+ 		return ERR_PTR(-ENODEV);
+ 	}
+ 
+--- /dev/null
++++ b/drivers/soc/qcom/smp2p-sleepstate.c
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Tell interested remote processors whether the application processor is
++ * awake, over an SMP2P state entry.
++ *
++ * Qualcomm DSP firmware watches this bit to adjust its own behaviour
++ * around the AP suspending: on the SM8250 the sensor DSP (SLPI) expects
++ * it, and without the notification its services fault across a suspend
++ * cycle and the whole DSP is restarted on resume, taking every sensor
++ * session with it. Ported from the downstream smp2p_sleepstate driver.
++ */
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_wakeup.h>
++#include <linux/soc/qcom/smem_state.h>
++#include <linux/suspend.h>
++
++#define SLEEPSTATE_PROC_AWAKE_BIT	BIT(12)
++
++struct smp2p_sleepstate {
++	struct qcom_smem_state *state;
++	struct notifier_block nb;
++	struct wakeup_source *ws;
++};
++
++static int sleepstate_pm_notifier(struct notifier_block *nb,
++				  unsigned long event, void *unused)
++{
++	struct smp2p_sleepstate *ss = container_of(nb, struct smp2p_sleepstate, nb);
++
++	switch (event) {
++	case PM_SUSPEND_PREPARE:
++		qcom_smem_state_update_bits(ss->state,
++					    SLEEPSTATE_PROC_AWAKE_BIT, 0);
++		break;
++	case PM_POST_SUSPEND:
++		qcom_smem_state_update_bits(ss->state,
++					    SLEEPSTATE_PROC_AWAKE_BIT,
++					    SLEEPSTATE_PROC_AWAKE_BIT);
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static irqreturn_t smp2p_sleepstate_handler(int irq, void *data)
++{
++	struct smp2p_sleepstate *ss = data;
++
++	/* The remote side wants the AP up for a moment; hold it awake. */
++	__pm_wakeup_event(ss->ws, 200);
++	return IRQ_HANDLED;
++}
++
++static int smp2p_sleepstate_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct smp2p_sleepstate *ss;
++	int irq, ret;
++
++	ss = devm_kzalloc(dev, sizeof(*ss), GFP_KERNEL);
++	if (!ss)
++		return -ENOMEM;
++
++	ss->state = devm_qcom_smem_state_get(dev, NULL, &ret);
++	if (IS_ERR(ss->state))
++		return dev_err_probe(dev, PTR_ERR(ss->state),
++				     "cannot get smem state\n");
++
++	qcom_smem_state_update_bits(ss->state, SLEEPSTATE_PROC_AWAKE_BIT,
++				    SLEEPSTATE_PROC_AWAKE_BIT);
++
++	ss->ws = wakeup_source_register(dev, "smp2p-sleepstate");
++	if (!ss->ws)
++		return -ENOMEM;
++
++	/* The inbound direction is optional. */
++	irq = platform_get_irq(pdev, 0);
++	if (irq > 0) {
++		ret = devm_request_threaded_irq(dev, irq, NULL,
++						smp2p_sleepstate_handler,
++						IRQF_ONESHOT | IRQF_TRIGGER_RISING,
++						"smp2p_sleepstate", ss);
++		if (ret) {
++			wakeup_source_unregister(ss->ws);
++			return dev_err_probe(dev, ret, "cannot request irq\n");
++		}
++		enable_irq_wake(irq);
++	}
++
++	ss->nb.notifier_call = sleepstate_pm_notifier;
++	ss->nb.priority = INT_MAX;
++	ret = register_pm_notifier(&ss->nb);
++	if (ret) {
++		wakeup_source_unregister(ss->ws);
++		return dev_err_probe(dev, ret, "cannot register pm notifier\n");
++	}
++
++	platform_set_drvdata(pdev, ss);
++	return 0;
++}
++
++static void smp2p_sleepstate_remove(struct platform_device *pdev)
++{
++	struct smp2p_sleepstate *ss = platform_get_drvdata(pdev);
++
++	unregister_pm_notifier(&ss->nb);
++	wakeup_source_unregister(ss->ws);
++}
++
++static const struct of_device_id smp2p_sleepstate_of_match[] = {
++	{ .compatible = "qcom,smp2p-sleepstate" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, smp2p_sleepstate_of_match);
++
++static struct platform_driver smp2p_sleepstate_driver = {
++	.probe = smp2p_sleepstate_probe,
++	.remove = smp2p_sleepstate_remove,
++	.driver = {
++		.name = "smp2p-sleepstate",
++		.of_match_table = smp2p_sleepstate_of_match,
++	},
++};
++module_platform_driver(smp2p_sleepstate_driver);
++
++MODULE_DESCRIPTION("Qualcomm SMP2P sleep state notifier");
++MODULE_LICENSE("GPL");
+--- a/include/linux/firmware/qcom/qcom_scm.h
++++ b/include/linux/firmware/qcom/qcom_scm.h
+@@ -96,6 +96,8 @@
+ 
+ int qcom_scm_io_readl(phys_addr_t addr, unsigned int *val);
+ int qcom_scm_io_writel(phys_addr_t addr, unsigned int val);
++int qcom_scm_spmi_pmic_arbiter_halt(void);
++int qcom_scm_deassert_ps_hold(void);
+ 
+ bool qcom_scm_restore_sec_cfg_available(void);
+ int qcom_scm_restore_sec_cfg(u32 device_id, u32 spare);

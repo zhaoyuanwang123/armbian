@@ -1,0 +1,6013 @@
+From: Zhao_Wang <umi@xiaomi>
+Subject: [PATCH] MHI host: SDX55M fusion support, Sahara loader, keepalive, satellite (+client callback adaptation)
+
+Xiaomi Mi 10 (umi): MHI host: SDX55M fusion support, Sahara loader, keepalive, satellite (+client callback adaptation) — ported from the Mi 10T pmOS
+kernel set onto 7.2.11; naming unified to umi. Part of the
+SDX55m external modem (mobile data) bring-up.
+
+Signed-off-by: Zhao_Wang <umi@xiaomi>
+---
+--- a/drivers/accel/qaic/mhi_controller.c
++++ b/drivers/accel/qaic/mhi_controller.c
+@@ -776,12 +776,12 @@
+ 	writel_relaxed(val, addr);
+ }
+ 
+-static int mhi_runtime_get(struct mhi_controller *mhi_cntrl)
++static int mhi_runtime_get(struct mhi_controller *mhi_cntrl, void *priv)
+ {
+ 	return 0;
+ }
+ 
+-static void mhi_runtime_put(struct mhi_controller *mhi_cntrl)
++static void mhi_runtime_put(struct mhi_controller *mhi_cntrl, void *priv)
+ {
+ }
+ 
+--- a/drivers/bus/mhi/host/Kconfig
++++ b/drivers/bus/mhi/host/Kconfig
+@@ -29,3 +29,45 @@
+ 	  This driver provides MHI PCI controller driver for devices such as
+ 	  Qualcomm SDX55 based PCIe modems.
+ 
++config MHI_BUS_SAHARA_MODEM
++	tristate "MHI Sahara modem firmware loader"
++	depends on MHI_BUS
++	help
++	  Driver that implements the Sahara v2 firmware transfer protocol
++	  over MHI channels 2/3.  Required for Qualcomm Fusion modems
++	  (e.g. SDX55 on Xiaomi Mi 10T / Umi) that have no onboard
++	  flash and load AMSS via Sahara after SBL EE.
++
++config MHI_BUS_BL_LOGGER
++	tristate "MHI boot logger client"
++	depends on MHI_BUS
++	default y if MHI_BUS_PCI_GENERIC
++	help
++	  Driver that drains the SBL boot-logger channel exposed by some
++	  Qualcomm PCIe modems. This is used by vendor SDX55 fusion setups
++	  alongside SAHARA during early boot.
++
++config MHI_BUS_SATELLITE
++	tristate "MHI satellite (share channels with a remote subsystem)"
++	depends on MHI_BUS && RPMSG
++	help
++	  Let a remote subsystem drive some of the MHI channels itself. The
++	  remote supplies its own channel and event ring contexts over a
++	  glink/rpmsg link and rings the doorbells directly; this driver only
++	  proxies the operations it cannot perform, such as IOMMU mapping and
++	  channel start/stop.
++
++	  Needed for call audio on boards where the modem is on PCIe and the
++	  audio DSP has to talk to it without the CPU in the data path.
++
++config MHI_BUS_CHAN_KEEPALIVE
++	tristate "MHI control-channel keep-alive (SDX55 Fusion)"
++	depends on MHI_BUS
++	default y if MHI_BUS_PCI_GENERIC
++	help
++	  Open and keep alive the EFS/QMI1/IP_CTRL MHI channels exposed by
++	  the SDX55 Fusion AMSS execution environment.  Vendor kernels open
++	  these via DT-defined client mappings; mainline declares them in
++	  the controller config but no in-tree client binds, so the channels
++	  are never STARTed.  Used as a hypothesis test for whether channel
++	  completeness affects post-MISSION modem stability on Umi.
+--- a/drivers/bus/mhi/host/Makefile
++++ b/drivers/bus/mhi/host/Makefile
+@@ -4,3 +4,14 @@
+ 
+ obj-$(CONFIG_MHI_BUS_PCI_GENERIC) += mhi_pci_generic.o
+ mhi_pci_generic-y += pci_generic.o
++
++obj-$(CONFIG_MHI_BUS_SAHARA_MODEM) += mhi_sahara_modem.o
++mhi_sahara_modem-y += sahara.o
++
++obj-$(CONFIG_MHI_BUS_BL_LOGGER) += mhi_bl_logger.o
++mhi_bl_logger-y += mhi_bl.o
++
++obj-$(CONFIG_MHI_BUS_CHAN_KEEPALIVE) += mhi_chan_keepalive.o
++
++obj-$(CONFIG_MHI_BUS_SATELLITE) += mhi_satellite.o
++mhi_satellite-y += satellite.o
+--- a/drivers/bus/mhi/host/boot.c
++++ b/drivers/bus/mhi/host/boot.c
+@@ -13,6 +13,7 @@
+ #include <linux/list.h>
+ #include <linux/mhi.h>
+ #include <linux/module.h>
++#include <linux/pci.h>
+ #include <linux/random.h>
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+@@ -72,10 +73,10 @@
+ 	void __iomem *base = mhi_cntrl->bhie;
+ 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
+ 
+-	dev_dbg(dev, "Entered with pm_state:%s dev_state:%s ee:%s\n",
+-		to_mhi_pm_state_str(mhi_cntrl->pm_state),
+-		mhi_state_str(mhi_cntrl->dev_state),
+-		TO_MHI_EXEC_STR(mhi_cntrl->ee));
++	dev_info(dev, "RDDM panic path entered: pm_state=%s dev_state=%s ee=%s\n",
++		 to_mhi_pm_state_str(mhi_cntrl->pm_state),
++		 mhi_state_str(mhi_cntrl->dev_state),
++		 TO_MHI_EXEC_STR(mhi_cntrl->ee));
+ 
+ 	/*
+ 	 * This should only be executing during a kernel panic, we expect all
+@@ -102,10 +103,10 @@
+ 		goto error_exit_rddm;
+ 
+ 	if (ee != MHI_EE_RDDM) {
+-		dev_dbg(dev, "Trigger device into RDDM mode using SYS ERR\n");
++		dev_warn(dev, "RDDM: triggering device into RDDM via SYS_ERR\n");
+ 		mhi_set_mhi_state(mhi_cntrl, MHI_STATE_SYS_ERR);
+ 
+-		dev_dbg(dev, "Waiting for device to enter RDDM\n");
++		dev_info(dev, "RDDM: waiting for device to enter RDDM\n");
+ 		while (rddm_retry--) {
+ 			ee = mhi_get_exec_env(mhi_cntrl);
+ 			if (ee == MHI_EE_RDDM)
+@@ -116,8 +117,8 @@
+ 
+ 		if (rddm_retry <= 0) {
+ 			/* Hardware reset so force device to enter RDDM */
+-			dev_dbg(dev,
+-				"Did not enter RDDM, do a host req reset\n");
++			dev_warn(dev,
++				 "RDDM: device did not enter RDDM, doing host-requested reset\n");
+ 			mhi_soc_reset(mhi_cntrl);
+ 			udelay(delayus);
+ 		}
+@@ -125,9 +126,9 @@
+ 		ee = mhi_get_exec_env(mhi_cntrl);
+ 	}
+ 
+-	dev_dbg(dev,
+-		"Waiting for RDDM image download via BHIe, current EE:%s\n",
+-		TO_MHI_EXEC_STR(ee));
++	dev_info(dev,
++		 "RDDM: waiting for image download via BHIe, current EE=%s\n",
++		 TO_MHI_EXEC_STR(ee));
+ 
+ 	while (retry--) {
+ 		ret = mhi_read_reg_field(mhi_cntrl, base, BHIE_RXVECSTATUS_OFFS,
+@@ -207,6 +208,14 @@
+ 	read_unlock_bh(pm_lock);
+ }
+ 
++static void mhi_fw_load_timeout_dump(struct mhi_controller *mhi_cntrl, u32 tx_status)
++{
++	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++
++	dev_err(dev, "BHI transfer timed out, BHI_STATUS: 0x%x\n", tx_status);
++	mhi_fw_load_error_dump(mhi_cntrl);
++}
++
+ static int mhi_fw_load_bhie(struct mhi_controller *mhi_cntrl,
+ 			    const struct mhi_buf *mhi_buf)
+ {
+@@ -295,7 +304,12 @@
+ 		goto invalid_pm_state;
+ 	}
+ 
+-	return (!ret) ? -ETIMEDOUT : 0;
++	if (!ret) {
++		mhi_fw_load_timeout_dump(mhi_cntrl, tx_status);
++		return -ETIMEDOUT;
++	}
++
++	return 0;
+ 
+ invalid_pm_state:
+ 
+@@ -358,13 +372,17 @@
+ 
+ int mhi_alloc_bhie_table(struct mhi_controller *mhi_cntrl,
+ 			 struct image_info **image_info,
+-			 size_t alloc_size)
+-{
+-	size_t seg_size = mhi_cntrl->seg_len;
+-	int segments = DIV_ROUND_UP(alloc_size, seg_size) + 1;
++			 size_t alloc_size, size_t seg_size)
++{
++	int segments;
+ 	int i;
+ 	struct image_info *img_info;
+ 	struct mhi_buf *mhi_buf;
++
++	if (!seg_size)
++		return -EINVAL;
++
++	segments = DIV_ROUND_UP(alloc_size, seg_size) + 1;
+ 
+ 	img_info = kzalloc_flex(*img_info, mhi_buf, segments);
+ 	if (!img_info)
+@@ -436,6 +454,34 @@
+ 	}
+ }
+ 
++static int mhi_request_firmware(struct device *dev, const char *fw_name,
++				const struct firmware **firmware)
++{
++	char alt_name[NAME_MAX];
++	const char *suffix;
++	int ret;
++
++	ret = request_firmware(firmware, fw_name, dev);
++	if (!ret)
++		return 0;
++
++	if (!fw_name)
++		return ret;
++
++	if (str_has_prefix(fw_name, "qcom/")) {
++		suffix = fw_name + strlen("qcom/");
++		if (snprintf(alt_name, sizeof(alt_name), "%s", suffix) >= sizeof(alt_name))
++			return ret;
++	} else {
++		if (snprintf(alt_name, sizeof(alt_name), "qcom/%s", fw_name) >= sizeof(alt_name))
++			return ret;
++	}
++
++	dev_info(dev, "Firmware %s not found, trying %s\n", fw_name, alt_name);
++
++	return request_firmware(firmware, alt_name, dev);
++}
++
+ static int mhi_load_image_bhi(struct mhi_controller *mhi_cntrl, const u8 *fw_data, size_t size)
+ {
+ 	struct image_info *image;
+@@ -459,7 +505,7 @@
+ 	struct image_info *image;
+ 	int ret;
+ 
+-	ret = mhi_alloc_bhie_table(mhi_cntrl, &image, size);
++	ret = mhi_alloc_bhie_table(mhi_cntrl, &image, size, mhi_cntrl->seg_len);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -494,8 +540,39 @@
+ 		dev_err(dev, "Could not capture serial number via BHI\n");
+ 
+ 	/* wait for ready on pass through or any other execution environment */
+-	if (!MHI_FW_LOAD_CAPABLE(mhi_cntrl->ee))
++	if (!MHI_FW_LOAD_CAPABLE(mhi_cntrl->ee)) {
++		/*
++		 * Self-boot modem caught mid-boot in SBL: the workqueue that
++		 * processes DEV_ST_TRANSITION_PBL can be delayed enough that
++		 * the modem has already left PBL by the time we read EE here.
++		 * Do NOT call mhi_ready_state_transition yet — the modem will
++		 * reset MHI when it jumps to AMSS, wiping the MMIO state we
++		 * just configured, making the host deaf to the AMSS EE event.
++		 * Wait for AMSS before proceeding to fw_load_ready_state so
++		 * mhi_ready_state_transition runs against a stable modem.
++		 */
++		if (mhi_cntrl->ee == MHI_EE_SBL && !mhi_cntrl->fbc_download) {
++			enum mhi_ee_type ee;
++			int wait_ms = 2000;
++
++			dev_dbg(dev, "Self-boot modem in SBL, waiting for AMSS\n");
++			do {
++				msleep(50);
++				wait_ms -= 50;
++				ee = mhi_get_exec_env(mhi_cntrl);
++			} while (!MHI_IN_MISSION_MODE(ee) && wait_ms > 0);
++
++			if (!MHI_IN_MISSION_MODE(ee)) {
++				dev_err(dev,
++					"Self-boot modem did not reach AMSS (stuck in %s)\n",
++					TO_MHI_EXEC_STR(ee));
++				goto error_fw_load;
++			}
++			dev_info(dev, "Self-boot modem reached %s, continuing\n",
++				 TO_MHI_EXEC_STR(ee));
++		}
+ 		goto fw_load_ready_state;
++	}
+ 
+ 	fw_name = (mhi_cntrl->ee == MHI_EE_EDL) ?
+ 		mhi_cntrl->edl_image : mhi_cntrl->fw_image;
+@@ -514,17 +591,41 @@
+ 		goto skip_req_fw;
+ 	}
+ 
+-	if (!fw_name || (mhi_cntrl->fbc_download && (!mhi_cntrl->sbl_size ||
+-						     !mhi_cntrl->seg_len))) {
+-		dev_err(dev,
+-			"No firmware image defined or !sbl_size || !seg_len\n");
++	if (!fw_name)
++		goto fw_load_ready_state;
++
++	if (mhi_cntrl->fbc_download && (!mhi_cntrl->sbl_size || !mhi_cntrl->seg_len)) {
++		dev_err(dev, "fbc_download set but !sbl_size || !seg_len\n");
+ 		goto error_fw_load;
+ 	}
+ 
+-	ret = request_firmware(&firmware, fw_name, dev);
++	ret = mhi_request_firmware(dev, fw_name, &firmware);
+ 	if (ret) {
+ 		dev_err(dev, "Error loading firmware: %d\n", ret);
+ 		goto error_fw_load;
++	}
++
++	dev_info(dev, "Loading firmware %s (%zu bytes)\n", fw_name, firmware->size);
++
++	/* Dump EP MSI state BEFORE BHI load (baseline) */
++	{
++		struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++		int msi_cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
++		if (msi_cap) {
++			u16 mc = 0;
++			u32 al = 0, ah = 0;
++			u16 md = 0;
++			pci_read_config_word(pdev, msi_cap + PCI_MSI_FLAGS, &mc);
++			pci_read_config_dword(pdev, msi_cap + PCI_MSI_ADDRESS_LO, &al);
++			if (mc & PCI_MSI_FLAGS_64BIT) {
++				pci_read_config_dword(pdev, msi_cap + PCI_MSI_ADDRESS_HI, &ah);
++				pci_read_config_word(pdev, msi_cap + PCI_MSI_DATA_64, &md);
++			} else {
++				pci_read_config_word(pdev, msi_cap + PCI_MSI_DATA_32, &md);
++			}
++			dev_info(dev, "PRE-BHI EP MSI: ctrl=0x%04x addr=0x%08x%08x data=0x%04x\n",
++				 mc, ah, al, md);
++		}
+ 	}
+ 
+ 	size = (mhi_cntrl->fbc_download) ? mhi_cntrl->sbl_size : firmware->size;
+@@ -545,10 +646,49 @@
+ 
+ 	/* Error or in EDL mode, we're done */
+ 	if (ret) {
++		release_firmware(firmware);
++		firmware = NULL;
+ 		dev_err(dev, "MHI did not load image over BHI%s, ret: %d\n",
+ 			fw_load_type == MHI_FW_LOAD_BHIE ? "e" : "",
+ 			ret);
+-		release_firmware(firmware);
++
++		/*
++		 * For self-boot modems (e.g. SDX55M with on-board flash) a BHI
++		 * TZ auth rejection (e.g. 0xef120700) is expected — the upload
++		 * attempt itself is the trigger for the modem's internal
++		 * self-boot sequence.  Poll up to 1.5 s for the modem to leave
++		 * PBL.  If it does, fall through to the normal READY-state
++		 * handshake instead of aborting the MHI probe.
++		 * Guard on !fbc_download so that modems that genuinely need BHI
++		 * to succeed still abort on failure.
++		 */
++		if (!mhi_cntrl->fbc_download) {
++			enum mhi_ee_type ee;
++			int wait_ms = 2500;
++
++			/*
++			 * Wait for AMSS (mission mode), not just any non-PBL
++			 * state.  Stopping at SBL and calling fw_load_ready_state
++			 * would initialise MMIO while the modem is still in SBL;
++			 * when AMSS starts it resets MHI and clears those MMIO
++			 * registers, so the host never receives the AMSS EE event.
++			 * Waiting here until AMSS ensures mhi_ready_state_transition
++			 * runs against a stable, fully-booted modem.
++			 */
++			do {
++				msleep(50);
++				wait_ms -= 50;
++				ee = mhi_get_exec_env(mhi_cntrl);
++			} while (!MHI_IN_MISSION_MODE(ee) && wait_ms > 0);
++
++			if (MHI_IN_MISSION_MODE(ee)) {
++				dev_info(dev,
++					 "Modem self-booted to %s after BHI failure, continuing\n",
++					 TO_MHI_EXEC_STR(ee));
++				goto fw_load_ready_state;
++			}
++		}
++
+ 		goto error_fw_load;
+ 	}
+ 
+@@ -577,7 +717,8 @@
+ 			fw_sz -= mhi_cntrl->sbl_size;
+ 		}
+ 
+-		ret = mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->fbc_image, fw_sz);
++		ret = mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->fbc_image,
++					   fw_sz, mhi_cntrl->seg_len);
+ 		if (ret) {
+ 			release_firmware(firmware);
+ 			goto error_fw_load;
+@@ -595,6 +736,75 @@
+ 	if (ret) {
+ 		dev_err(dev, "MHI did not enter READY state\n");
+ 		goto error_ready_state;
++	}
++
++	/*
++	 * For self-boot devices (e.g. SDX55M with on-board flash) the modem
++	 * may have already advanced past PBL by the time mhi_ready_state_transition
++	 * returns.  mhi_cntrl->ee is still the value cached when
++	 * DEV_ST_TRANSITION_PBL ran (MHI_EE_PBL), so check the hardware
++	 * register directly.  If the device is already in SBL or AMSS we
++	 * won't get another EE-change interrupt, so queue the transition now.
++	 */
++	{
++		enum mhi_ee_type cur_ee = mhi_get_exec_env(mhi_cntrl);
++
++		dev_info(dev, "After READY: EE=%s (%d), PM=%s, dev_state=%s\n",
++			 TO_MHI_EXEC_STR(cur_ee), cur_ee,
++			 to_mhi_pm_state_str(mhi_cntrl->pm_state),
++			 mhi_state_str(mhi_cntrl->dev_state));
++
++		/* Dump endpoint MSI capability + RC iMSI-RX address for debug */
++		{
++			struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++			int msi_cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
++			u16 msi_ctrl = 0;
++			u32 msi_addr_lo = 0, msi_addr_hi = 0;
++			u16 msi_data = 0;
++			u32 rc_msi_lo = 0, rc_msi_hi = 0;
++
++			if (msi_cap) {
++				pci_read_config_word(pdev, msi_cap + PCI_MSI_FLAGS, &msi_ctrl);
++				pci_read_config_dword(pdev, msi_cap + PCI_MSI_ADDRESS_LO, &msi_addr_lo);
++				if (msi_ctrl & PCI_MSI_FLAGS_64BIT) {
++					pci_read_config_dword(pdev, msi_cap + PCI_MSI_ADDRESS_HI, &msi_addr_hi);
++					pci_read_config_word(pdev, msi_cap + PCI_MSI_DATA_64, &msi_data);
++				} else {
++					pci_read_config_word(pdev, msi_cap + PCI_MSI_DATA_32, &msi_data);
++				}
++				dev_info(dev, "EP MSI cap@0x%x: ctrl=0x%04x addr=0x%08x%08x data=0x%04x\n",
++					 msi_cap, msi_ctrl, msi_addr_hi, msi_addr_lo, msi_data);
++			} else {
++				dev_warn(dev, "EP has no MSI capability!\n");
++			}
++
++			/* Read RC's iMSI-RX address from bridge DBI (config space) */
++			{
++				struct pci_dev *bridge = pci_upstream_bridge(pdev);
++				if (bridge) {
++					/* Read the RC's MSI address from the bridge's config */
++					dev_info(dev, "RC bridge: %s\n", dev_name(&bridge->dev));
++				}
++			}
++
++			/* Dump MHI event ring config for MSI vector info */
++			{
++				int i;
++				for (i = 0; i < mhi_cntrl->total_ev_rings && i < 4; i++) {
++					struct mhi_event *ev = &mhi_cntrl->mhi_event[i];
++					dev_info(dev, "ER[%d]: irq_idx=%u linux_irq=%u intmod=%u offload=%d\n",
++						 i, ev->irq,
++						 (ev->irq < mhi_cntrl->nr_irqs) ?
++						  mhi_cntrl->irq[ev->irq] : 0,
++						 ev->intmod, ev->offload_ev);
++				}
++			}
++		}
++
++		if (cur_ee == MHI_EE_SBL)
++			mhi_queue_state_transition(mhi_cntrl, DEV_ST_TRANSITION_SBL);
++		else if (MHI_IN_MISSION_MODE(cur_ee))
++			mhi_queue_state_transition(mhi_cntrl, DEV_ST_TRANSITION_MISSION_MODE);
+ 	}
+ 
+ 	dev_info(dev, "Wait for device to enter SBL or Mission mode\n");
+--- a/drivers/bus/mhi/host/init.c
++++ b/drivers/bus/mhi/host/init.c
+@@ -17,6 +17,10 @@
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+ #include <linux/wait.h>
++#if IS_REACHABLE(CONFIG_QCOM_SCM)
++#include <dt-bindings/firmware/qcom,scm.h>
++#include <linux/firmware/qcom/qcom_scm.h>
++#endif
+ #include "internal.h"
+ 
+ #define CREATE_TRACE_POINTS
+@@ -97,6 +101,13 @@
+ 	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
+ 	u32 hash_segment[MHI_MAX_OEM_PK_HASH_SEGMENTS];
+ 	int i, cnt = 0, ret;
++
++	/*
++	 * The BHI window is torn down by mhi_unprepare_after_power_down(), so
++	 * a read racing with (or following) a crash would dereference NULL.
++	 */
++	if (!mhi_cntrl->bhi)
++		return -ENODEV;
+ 
+ 	for (i = 0; i < MHI_MAX_OEM_PK_HASH_SEGMENTS; i++) {
+ 		ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->bhi, BHI_OEMPKHASH(i), &hash_segment[i]);
+@@ -536,7 +547,12 @@
+ 		{0, 0}
+ 	};
+ 
+-	dev_dbg(dev, "Initializing MHI registers\n");
++	dev_info(dev, "Initializing MHI registers\n");
++	dev_info(dev, "MMIO ctxt addrs: CCABAP=0x%llx ECABAP=0x%llx CRCBAP=0x%llx iova=[0x%llx-0x%llx]\n",
++		 mhi_cntrl->mhi_ctxt->chan_ctxt_addr,
++		 mhi_cntrl->mhi_ctxt->er_ctxt_addr,
++		 mhi_cntrl->mhi_ctxt->cmd_ctxt_addr,
++		 mhi_cntrl->iova_start, mhi_cntrl->iova_stop);
+ 
+ 	/* Read channel db offset */
+ 	ret = mhi_get_channel_doorbell_offset(mhi_cntrl, &val);
+@@ -1162,7 +1178,8 @@
+ 		 * Allocate RDDM table for debugging purpose if specified
+ 		 */
+ 		mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->rddm_image,
+-				     mhi_cntrl->rddm_size);
++				     mhi_cntrl->rddm_size,
++				     mhi_cntrl->rddm_seg_len);
+ 		if (mhi_cntrl->rddm_image) {
+ 			ret = mhi_rddm_prepare(mhi_cntrl,
+ 					       mhi_cntrl->rddm_image);
+@@ -1188,6 +1205,161 @@
+ }
+ EXPORT_SYMBOL_GPL(mhi_prepare_for_power_up);
+ 
++/**
++ * mhi_mem_protect - donate MHI control-path DMA buffers to VMID_MSS_MSA
++ * @mhi_cntrl: MHI controller
++ *
++ * On SM8250 platforms with an external SDX55M modem connected via PCIe2,
++ * TrustZone stage-2 SMMU context bank 12 (SID 0x1d01) blocks the modem from
++ * DMA-writing to host memory unless the physical pages have been explicitly
++ * donated to VMID_MSS_MSA via qcom_scm_assign_mem().
++ *
++ * Call this after mhi_prepare_for_power_up() (which allocates the rings) and
++ * before mhi_sync_power_up() (which starts the modem and allows it to write
++ * to event rings).
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++/*
++ * Helper: share a memory region with the modem VMID via TZ SCM call.
++ * qcom_scm_assign_mem requires page-aligned physical addresses.
++ *
++ * dma_alloc_coherent with IOMMU returns vmalloc-space addresses, so
++ * virt_to_phys() does NOT work.  We must use vmalloc_to_page() per page
++ * to resolve the real physical address.
++ */
++#if IS_REACHABLE(CONFIG_QCOM_SCM)
++#include <linux/vmalloc.h>
++
++/* Pages already shared with MSS — avoids double-assign on overlapping pages */
++#define MHI_SCM_MAX_PAGES 64
++
++static phys_addr_t mhi_virt_to_phys(void *vaddr)
++{
++	if (is_vmalloc_addr(vaddr))
++		return page_to_phys(vmalloc_to_page(vaddr)) + offset_in_page(vaddr);
++	return virt_to_phys(vaddr);
++}
++
++static int mhi_scm_share(struct device *dev, void *vaddr, size_t size,
++			 const struct qcom_scm_vmperm *newvm, int dest_cnt,
++			 phys_addr_t *done_pages, int *done_cnt)
++{
++	unsigned int nr_pages = PAGE_ALIGN(offset_in_page(vaddr) + size) >> PAGE_SHIFT;
++	void *cur = (void *)((unsigned long)vaddr & PAGE_MASK);
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < nr_pages; i++, cur += PAGE_SIZE) {
++		phys_addr_t phys = mhi_virt_to_phys(cur);
++		int j, already = 0;
++		u64 srcvm;
++
++		for (j = 0; j < *done_cnt; j++) {
++			if (done_pages[j] == phys) {
++				already = 1;
++				break;
++			}
++		}
++		if (already)
++			continue;
++
++		srcvm = BIT(QCOM_SCM_VMID_HLOS);
++		ret = qcom_scm_assign_mem(phys, PAGE_SIZE, &srcvm, newvm, dest_cnt);
++		if (ret) {
++			dev_err(dev, "mhi_scm_share: phys %pa failed: %d\n",
++				&phys, ret);
++			return ret;
++		}
++		if (*done_cnt < MHI_SCM_MAX_PAGES)
++			done_pages[(*done_cnt)++] = phys;
++	}
++	return 0;
++}
++#endif
++
++int mhi_mem_protect(struct mhi_controller *mhi_cntrl)
++{
++#if IS_REACHABLE(CONFIG_QCOM_SCM)
++	struct mhi_ctxt *mhi_ctxt = mhi_cntrl->mhi_ctxt;
++	struct mhi_event *mhi_event;
++	struct mhi_cmd *mhi_cmd;
++	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++	const struct qcom_scm_vmperm newvm[2] = {
++		{ QCOM_SCM_VMID_HLOS,    QCOM_SCM_PERM_RW },
++		{ QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW },
++	};
++	phys_addr_t done_pages[MHI_SCM_MAX_PAGES];
++	int done_cnt = 0;
++	int i, ret;
++
++	if (!mhi_ctxt)
++		return -EINVAL;
++
++	/* Event context table (modem reads ring base/len, writes rp/wp) */
++	ret = mhi_scm_share(dev, mhi_ctxt->er_ctxt,
++			    sizeof(*mhi_ctxt->er_ctxt) * mhi_cntrl->total_ev_rings,
++			    newvm, 2, done_pages, &done_cnt);
++	if (ret) {
++		dev_err(dev, "mhi_mem_protect: er_ctxt failed: %d\n", ret);
++		return ret;
++	}
++
++	/* Event ring TRE buffers (modem writes completion events here) */
++	mhi_event = mhi_cntrl->mhi_event;
++	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
++		if (mhi_event->offload_ev)
++			continue;
++		ret = mhi_scm_share(dev, mhi_event->ring.pre_aligned,
++				    mhi_event->ring.alloc_size,
++				    newvm, 2, done_pages, &done_cnt);
++		if (ret) {
++			dev_err(dev, "mhi_mem_protect: event ring %d failed: %d\n",
++				i, ret);
++			return ret;
++		}
++	}
++
++	/* Channel context table (modem reads ring base/len/rp/wp) */
++	ret = mhi_scm_share(dev, mhi_ctxt->chan_ctxt,
++			    sizeof(*mhi_ctxt->chan_ctxt) * mhi_cntrl->max_chan,
++			    newvm, 2, done_pages, &done_cnt);
++	if (ret) {
++		dev_err(dev, "mhi_mem_protect: chan_ctxt failed: %d\n", ret);
++		return ret;
++	}
++
++	/* Command context table */
++	ret = mhi_scm_share(dev, mhi_ctxt->cmd_ctxt,
++			    sizeof(*mhi_ctxt->cmd_ctxt) * NR_OF_CMD_RINGS,
++			    newvm, 2, done_pages, &done_cnt);
++	if (ret) {
++		dev_err(dev, "mhi_mem_protect: cmd_ctxt failed: %d\n", ret);
++		return ret;
++	}
++
++	/* Command ring TRE buffers */
++	mhi_cmd = mhi_cntrl->mhi_cmd;
++	for (i = 0; i < NR_OF_CMD_RINGS; i++, mhi_cmd++) {
++		ret = mhi_scm_share(dev, mhi_cmd->ring.pre_aligned,
++				    mhi_cmd->ring.alloc_size,
++				    newvm, 2, done_pages, &done_cnt);
++		if (ret) {
++			dev_err(dev, "mhi_mem_protect: cmd ring %d failed: %d\n",
++				i, ret);
++			return ret;
++		}
++	}
++
++	dev_info(dev, "MHI DMA buffers shared with VMID_MSS_MSA (%d pages)\n",
++		 done_cnt);
++	return 0;
++#else
++	return -EOPNOTSUPP;
++#endif
++}
++EXPORT_SYMBOL_GPL(mhi_mem_protect);
++
+ void mhi_unprepare_after_power_down(struct mhi_controller *mhi_cntrl)
+ {
+ 	if (mhi_cntrl->fbc_image) {
+--- a/drivers/bus/mhi/host/internal.h
++++ b/drivers/bus/mhi/host/internal.h
+@@ -322,7 +322,8 @@
+ void mhi_create_devices(struct mhi_controller *mhi_cntrl);
+ 
+ int mhi_alloc_bhie_table(struct mhi_controller *mhi_cntrl,
+-			 struct image_info **image_info, size_t alloc_size);
++			 struct image_info **image_info, size_t alloc_size,
++			 size_t seg_size);
+ void mhi_free_bhie_table(struct mhi_controller *mhi_cntrl,
+ 			 struct image_info *image_info);
+ 
+@@ -352,8 +353,8 @@
+ static inline void mhi_trigger_resume(struct mhi_controller *mhi_cntrl)
+ {
+ 	pm_wakeup_event(&mhi_cntrl->mhi_dev->dev, 0);
+-	mhi_cntrl->runtime_get(mhi_cntrl);
+-	mhi_cntrl->runtime_put(mhi_cntrl);
++	mhi_cntrl->runtime_get(mhi_cntrl, mhi_cntrl->priv_data);
++	mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
+ }
+ 
+ /* Register access methods */
+--- a/drivers/bus/mhi/host/main.c
++++ b/drivers/bus/mhi/host/main.c
+@@ -330,7 +330,7 @@
+ 	}
+ 
+ 	dev_dbg(&mhi_cntrl->mhi_dev->dev, "destroy device for chan:%s\n",
+-		 mhi_dev->name);
++		mhi_dev->name);
+ 
+ 	/* Notify the client and remove the device from MHI bus */
+ 	device_del(dev);
+@@ -484,6 +484,36 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/**
++ * mhi_poll_events - Poll all MHI event rings and state change vector
++ * @mhi_cntrl: MHI controller to poll
++ *
++ * This is used as a workaround when MSI delivery is non-functional (e.g.
++ * on Qualcomm SM8250 where the SMMU TBU intercepts MSI TLPs before the
++ * DW PCIe iMSI-RX module can catch them).  Call this periodically from
++ * a timer to process pending events without MSI.
++ */
++void mhi_poll_events(struct mhi_controller *mhi_cntrl)
++{
++	struct mhi_event *mhi_event;
++	int i;
++
++	/* Simulate BHI/state-change vector: wake up state waiters */
++	wake_up_all(&mhi_cntrl->state_event);
++
++	/* Poll each event ring */
++	if (!mhi_cntrl->mhi_ctxt)
++		return;
++
++	mhi_event = mhi_cntrl->mhi_event;
++	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
++		if (mhi_event->offload_ev)
++			continue;
++		mhi_irq_handler(0, mhi_event);
++	}
++}
++EXPORT_SYMBOL_GPL(mhi_poll_events);
++
+ irqreturn_t mhi_intvec_threaded_handler(int irq_number, void *priv)
+ {
+ 	struct mhi_controller *mhi_cntrl = priv;
+@@ -655,6 +685,24 @@
+ 			/* truncate to buf len if xfer_len is larger */
+ 			result.bytes_xferd =
+ 				min_t(u16, xfer_len, buf_info->len);
++
++			/* SDX55 silent-window probe: dump IPCR DL payload */
++			if (mhi_cntrl->ee == MHI_EE_AMSS &&
++			    mhi_chan->dir == DMA_FROM_DEVICE &&
++			    (mhi_chan->chan == 20 || mhi_chan->chan == 21) &&
++			    result.bytes_xferd && buf_info->cb_buf) {
++				size_t dlen = min_t(size_t,
++						    result.bytes_xferd, 48);
++
++				dev_dbg(dev,
++					"IPCR DL ch=%s(%d) len=%zu\n",
++					mhi_chan->name, mhi_chan->chan,
++					result.bytes_xferd);
++				print_hex_dump_debug("ipcr DL ",
++						     DUMP_PREFIX_OFFSET, 16, 1,
++						     buf_info->cb_buf, dlen, true);
++			}
++
+ 			mhi_del_ring_element(mhi_cntrl, buf_ring);
+ 			mhi_del_ring_element(mhi_cntrl, tre_ring);
+ 			local_rp = tre_ring->rp;
+@@ -665,9 +713,15 @@
+ 			mhi_chan->xfer_cb(mhi_chan->mhi_dev, &result);
+ 
+ 			if (mhi_chan->dir == DMA_TO_DEVICE) {
+-				atomic_dec(&mhi_cntrl->pending_pkts);
++				int pending = atomic_dec_return(&mhi_cntrl->pending_pkts);
++
++				if (mhi_cntrl->ee == MHI_EE_AMSS && pending < 16)
++					dev_dbg(&mhi_cntrl->mhi_dev->dev,
++						"pending_pkts-- ch=%s pending=%d status=%d\n",
++						mhi_chan->name, pending,
++						result.transaction_status);
+ 				/* Release the reference got from mhi_queue() */
+-				mhi_cntrl->runtime_put(mhi_cntrl);
++				mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
+ 			}
+ 
+ 			read_lock_bh(&mhi_chan->lock);
+@@ -838,10 +892,23 @@
+ 
+ 		trace_mhi_ctrl_event(mhi_cntrl, local_rp);
+ 
++		/*
++		 * Umi SDX55 diagnostic: dump every ctrl event so we can see
++		 * firmware-originated requests (TSYNC, BW_REQ, unhandled types)
++		 * in the window between mission mode and ERRFATAL.
++		 */
++		dev_dbg(dev,
++			"CTRL EV er=%u type=0x%02x ptr=0x%llx d0=0x%08x d1=0x%08x\n",
++			mhi_event->er_index, (unsigned int)type,
++			(unsigned long long)le64_to_cpu(local_rp->ptr),
++			le32_to_cpu(local_rp->dword[0]),
++			le32_to_cpu(local_rp->dword[1]));
++
+ 		switch (type) {
+ 		case MHI_PKT_TYPE_BW_REQ_EVENT:
+ 		{
+ 			struct mhi_link_info *link_info;
++			int ret;
+ 
+ 			link_info = &mhi_cntrl->mhi_link_info;
+ 			write_lock_irq(&mhi_cntrl->pm_lock);
+@@ -850,8 +917,20 @@
+ 			link_info->target_link_width =
+ 				MHI_TRE_GET_EV_LINKWIDTH(local_rp);
+ 			write_unlock_irq(&mhi_cntrl->pm_lock);
+-			dev_dbg(dev, "Received BW_REQ event\n");
+-			mhi_cntrl->status_cb(mhi_cntrl, MHI_CB_BW_REQ);
++			dev_info(dev,
++				 "BW_REQ event: target_speed=%u target_width=%u\n",
++				 link_info->target_link_speed,
++				 link_info->target_link_width);
++			if (mhi_cntrl->bw_scale) {
++				ret = mhi_cntrl->bw_scale(mhi_cntrl, link_info);
++				if (ret)
++					dev_warn(dev,
++						 "BW_REQ callback failed: %d (speed=%u width=%u)\n",
++						 ret, link_info->target_link_speed,
++						 link_info->target_link_width);
++			} else {
++				mhi_cntrl->status_cb(mhi_cntrl, MHI_CB_BW_REQ);
++			}
+ 			break;
+ 		}
+ 		case MHI_PKT_TYPE_STATE_CHANGE_EVENT:
+@@ -901,8 +980,8 @@
+ 			enum dev_st_transition st = DEV_ST_TRANSITION_MAX;
+ 			enum mhi_ee_type event = MHI_TRE_GET_EV_EXECENV(local_rp);
+ 
+-			dev_dbg(dev, "Received EE event: %s\n",
+-				TO_MHI_EXEC_STR(event));
++			dev_info(dev, "Received EE event: %s\n",
++				 TO_MHI_EXEC_STR(event));
+ 			switch (event) {
+ 			case MHI_EE_SBL:
+ 				st = DEV_ST_TRANSITION_SBL;
+@@ -947,7 +1026,12 @@
+ 			}
+ 			break;
+ 		default:
+-			dev_err(dev, "Unhandled event type: %d\n", type);
++			dev_warn(dev,
++				 "Unhandled ctrl event type: 0x%02x d0=0x%08x d1=0x%08x (er=%u)\n",
++				 (unsigned int)type,
++				 le32_to_cpu(local_rp->dword[0]),
++				 le32_to_cpu(local_rp->dword[1]),
++				 mhi_event->er_index);
+ 			break;
+ 		}
+ 
+@@ -1008,6 +1092,24 @@
+ 		chan = MHI_TRE_GET_EV_CHID(local_rp);
+ 
+ 		WARN_ON(chan >= mhi_cntrl->max_chan);
++
++		/*
++		 * Umi SDX55 diagnostic: catch any non-TX events landing on
++		 * the data event ring (TSYNC, BW_REQ, etc.) so we can see
++		 * firmware-originated requests we are not responding to.
++		 */
++		if (type != MHI_PKT_TYPE_TX_EVENT &&
++		    type != MHI_PKT_TYPE_RSC_TX_EVENT) {
++			struct device *ddev = &mhi_cntrl->mhi_dev->dev;
++
++			dev_warn(ddev,
++				 "DATA EV er=%u type=0x%02x chan=%u ptr=0x%llx d0=0x%08x d1=0x%08x\n",
++				 mhi_event->er_index, (unsigned int)type,
++				 chan,
++				 (unsigned long long)le64_to_cpu(local_rp->ptr),
++				 le32_to_cpu(local_rp->dword[0]),
++				 le32_to_cpu(local_rp->dword[1]));
++		}
+ 
+ 		/*
+ 		 * Only process the event ring elements whose channel
+@@ -1144,19 +1246,40 @@
+ 	 * for host->device buffer, balanced put is done on buffer completion
+ 	 * for device->host buffer, balanced put is after ringing the DB
+ 	 */
+-	mhi_cntrl->runtime_get(mhi_cntrl);
++	mhi_cntrl->runtime_get(mhi_cntrl, mhi_cntrl->priv_data);
+ 
+ 	/* Assert dev_wake (to exit/prevent M1/M2)*/
+ 	mhi_cntrl->wake_toggle(mhi_cntrl);
+ 
+-	if (mhi_chan->dir == DMA_TO_DEVICE)
+-		atomic_inc(&mhi_cntrl->pending_pkts);
++	if (mhi_chan->dir == DMA_TO_DEVICE) {
++		int pending = atomic_inc_return(&mhi_cntrl->pending_pkts);
++
++		if (mhi_cntrl->ee == MHI_EE_AMSS && pending <= 16)
++			dev_dbg(&mhi_cntrl->mhi_dev->dev,
++				"pending_pkts++ ch=%s pending=%d mflags=0x%x\n",
++				mhi_chan->name, pending, mflags);
++
++		/* SDX55 silent-window probe: dump IPCR UL payload */
++		if (mhi_cntrl->ee == MHI_EE_AMSS &&
++		    (mhi_chan->chan == 20 || mhi_chan->chan == 21) &&
++		    buf_info->v_addr && buf_info->len) {
++			size_t dlen = min_t(size_t, buf_info->len, 48);
++
++			dev_dbg(&mhi_cntrl->mhi_dev->dev,
++				"IPCR UL ch=%s(%d) len=%zu\n",
++				mhi_chan->name, mhi_chan->chan,
++				buf_info->len);
++			print_hex_dump_debug("ipcr UL ",
++					     DUMP_PREFIX_OFFSET, 16, 1,
++					     buf_info->v_addr, dlen, true);
++		}
++	}
+ 
+ 	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl)))
+ 		mhi_ring_chan_db(mhi_cntrl, mhi_chan);
+ 
+ 	if (dir == DMA_FROM_DEVICE)
+-		mhi_cntrl->runtime_put(mhi_cntrl);
++		mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
+ 
+ 	read_unlock_irqrestore(&mhi_cntrl->pm_lock, flags);
+ 
+@@ -1304,8 +1427,14 @@
+ 	/* queue to hardware */
+ 	mhi_add_ring_element(mhi_cntrl, ring);
+ 	read_lock_bh(&mhi_cntrl->pm_lock);
+-	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl)))
++	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl))) {
+ 		mhi_ring_cmd_db(mhi_cntrl, mhi_cmd);
++		dev_dbg(dev, "CMD ring DB rung: cmd=%d chan=%d PM=%s\n",
++			cmd, chan, to_mhi_pm_state_str(mhi_cntrl->pm_state));
++	} else {
++		dev_err(dev, "CMD ring DB skipped! PM=%s\n",
++			to_mhi_pm_state_str(mhi_cntrl->pm_state));
++	}
+ 	read_unlock_bh(&mhi_cntrl->pm_lock);
+ 	spin_unlock_bh(&mhi_cmd->lock);
+ 
+@@ -1358,7 +1487,7 @@
+ 	ret = mhi_device_get_sync(mhi_cntrl->mhi_dev);
+ 	if (ret)
+ 		return ret;
+-	mhi_cntrl->runtime_get(mhi_cntrl);
++	mhi_cntrl->runtime_get(mhi_cntrl, mhi_cntrl->priv_data);
+ 
+ 	reinit_completion(&mhi_chan->completion);
+ 	ret = mhi_send_cmd(mhi_cntrl, mhi_chan, cmd);
+@@ -1372,8 +1501,10 @@
+ 				       msecs_to_jiffies(mhi_cntrl->timeout_ms));
+ 	if (!ret || mhi_chan->ccs != MHI_EV_CC_SUCCESS) {
+ 		dev_err(dev,
+-			"%d: Failed to receive %s channel command completion\n",
+-			mhi_chan->chan, TO_CH_STATE_TYPE_STR(to_state));
++			"%d: Failed to receive %s channel command completion: %s (ret=%d ccs=%d timeout_ms=%u)\n",
++			mhi_chan->chan, TO_CH_STATE_TYPE_STR(to_state),
++			ret ? "bad status" : "timeout",
++			ret, mhi_chan->ccs, mhi_cntrl->timeout_ms);
+ 		ret = -EIO;
+ 		goto exit_channel_update;
+ 	}
+@@ -1389,7 +1520,7 @@
+ 
+ 	trace_mhi_channel_command_end(mhi_cntrl, mhi_chan, to_state, TPS("Updated"));
+ exit_channel_update:
+-	mhi_cntrl->runtime_put(mhi_cntrl);
++	mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
+ 	mhi_device_put(mhi_cntrl->mhi_dev);
+ 
+ 	return ret;
+@@ -1528,9 +1659,14 @@
+ 		struct mhi_buf_info *buf_info = buf_ring->rp;
+ 
+ 		if (mhi_chan->dir == DMA_TO_DEVICE) {
+-			atomic_dec(&mhi_cntrl->pending_pkts);
++			int pending = atomic_dec_return(&mhi_cntrl->pending_pkts);
++
++			if (mhi_cntrl->ee == MHI_EE_AMSS && pending < 16)
++				dev_dbg(&mhi_cntrl->mhi_dev->dev,
++					"pending_pkts-- reset ch=%s pending=%d\n",
++					mhi_chan->name, pending);
+ 			/* Release the reference got from mhi_queue() */
+-			mhi_cntrl->runtime_put(mhi_cntrl);
++			mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
+ 		}
+ 
+ 		if (!buf_info->pre_mapped)
+@@ -1601,6 +1737,76 @@
+ }
+ EXPORT_SYMBOL_GPL(mhi_prepare_for_transfer);
+ 
++int mhi_device_configure(struct mhi_device *mhi_dev,
++			 enum dma_data_direction dir,
++			 struct mhi_buf *buf,
++			 int elements)
++{
++	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
++	struct mhi_chan_ctxt *chan_ctxt;
++	struct mhi_event_ctxt *er_ctxt;
++	struct mhi_chan *mhi_chan;
++
++	switch (dir) {
++	case DMA_TO_DEVICE:
++		mhi_chan = mhi_dev->ul_chan;
++		break;
++	case DMA_FROM_DEVICE:
++	case DMA_BIDIRECTIONAL:
++	case DMA_NONE:
++		mhi_chan = mhi_dev->dl_chan;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (!mhi_chan)
++		return -ENODEV;
++
++	for (; elements > 0; elements--, buf++) {
++		if (!strcmp(buf->name, "ECA")) {
++			if (buf->len != sizeof(*er_ctxt))
++				return -EINVAL;
++
++			er_ctxt = &mhi_cntrl->mhi_ctxt->er_ctxt[mhi_chan->er_index];
++			memcpy(er_ctxt, buf->buf, sizeof(*er_ctxt));
++			continue;
++		}
++
++		if (!strcmp(buf->name, "CCA")) {
++			if (buf->len != sizeof(*chan_ctxt))
++				return -EINVAL;
++
++			chan_ctxt = &mhi_cntrl->mhi_ctxt->chan_ctxt[mhi_chan->chan];
++			memcpy(chan_ctxt, buf->buf, sizeof(*chan_ctxt));
++			continue;
++		}
++
++		return -EINVAL;
++	}
++
++	/* Make context writes visible before the channel is started. */
++	smp_wmb();
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mhi_device_configure);
++
++void mhi_get_channel_info(struct mhi_device *mhi_dev,
++			  u32 *ul_chan, u32 *dl_chan,
++			  u32 *ul_er, u32 *dl_er)
++{
++	if (ul_chan)
++		*ul_chan = mhi_dev->ul_chan ? mhi_dev->ul_chan->chan : U32_MAX;
++	if (dl_chan)
++		*dl_chan = mhi_dev->dl_chan ? mhi_dev->dl_chan->chan : U32_MAX;
++	if (ul_er)
++		*ul_er = mhi_dev->ul_chan ? mhi_dev->ul_chan->er_index : U32_MAX;
++	if (dl_er)
++		*dl_er = mhi_dev->dl_chan ? mhi_dev->dl_chan->er_index : U32_MAX;
++}
++EXPORT_SYMBOL_GPL(mhi_get_channel_info);
++
+ void mhi_unprepare_from_transfer(struct mhi_device *mhi_dev)
+ {
+ 	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
+--- /dev/null
++++ b/drivers/bus/mhi/host/mhi_bl.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Minimal MHI boot logger client for Qualcomm modem SBL boot messages.
++ *
++ * Some SDX55 fusion setups expose a DL-only "BL" channel in SBL EE in
++ * parallel with SAHARA. Vendor kernels bind a small consumer to drain that
++ * traffic. Keep the channel serviced even if the messages themselves are only
++ * used for debug.
++ */
++
++#include <linux/device.h>
++#include <linux/mhi.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++
++#define MHI_BL_RX_SIZE 0x1000
++
++struct mhi_bl_dev {
++	struct mhi_device *mhi_dev;
++	u8 *rx_buf;
++};
++
++static int mhi_bl_queue_rx(struct mhi_bl_dev *bdev)
++{
++	return mhi_queue_buf(bdev->mhi_dev, DMA_FROM_DEVICE, bdev->rx_buf,
++			     MHI_BL_RX_SIZE, MHI_EOT);
++}
++
++static int mhi_bl_probe(struct mhi_device *mhi_dev,
++			const struct mhi_device_id *id)
++{
++	struct mhi_bl_dev *bdev;
++	int ret;
++
++	bdev = devm_kzalloc(&mhi_dev->dev, sizeof(*bdev), GFP_KERNEL);
++	if (!bdev)
++		return -ENOMEM;
++
++	bdev->rx_buf = devm_kzalloc(&mhi_dev->dev, MHI_BL_RX_SIZE, GFP_KERNEL);
++	if (!bdev->rx_buf)
++		return -ENOMEM;
++
++	bdev->mhi_dev = mhi_dev;
++	dev_set_drvdata(&mhi_dev->dev, bdev);
++
++	ret = mhi_prepare_for_transfer(mhi_dev);
++	if (ret)
++		return ret;
++
++	ret = mhi_bl_queue_rx(bdev);
++	if (ret) {
++		mhi_unprepare_from_transfer(mhi_dev);
++		return ret;
++	}
++
++	dev_info(&mhi_dev->dev, "BL: boot logger channel ready\n");
++	return 0;
++}
++
++static void mhi_bl_remove(struct mhi_device *mhi_dev)
++{
++	mhi_unprepare_from_transfer(mhi_dev);
++}
++
++static void mhi_bl_dl_xfer_cb(struct mhi_device *mhi_dev,
++			      struct mhi_result *result)
++{
++	struct mhi_bl_dev *bdev = dev_get_drvdata(&mhi_dev->dev);
++	size_t n;
++
++	if (result->transaction_status || !result->bytes_xferd)
++		return;
++
++	n = min_t(size_t, result->bytes_xferd, MHI_BL_RX_SIZE - 1);
++	bdev->rx_buf[n] = '\0';
++
++	/* SBL boot logs are best-effort debug; keep them short in dmesg. */
++	dev_info(&mhi_dev->dev, "BL: %s\n", bdev->rx_buf);
++
++	if (mhi_bl_queue_rx(bdev))
++		dev_err(&mhi_dev->dev, "BL: failed to requeue RX buffer\n");
++}
++
++static void mhi_bl_ul_xfer_cb(struct mhi_device *mhi_dev,
++			      struct mhi_result *result)
++{
++}
++
++static const struct mhi_device_id mhi_bl_match_table[] = {
++	{ .chan = "BL" },
++	{}
++};
++MODULE_DEVICE_TABLE(mhi, mhi_bl_match_table);
++
++static struct mhi_driver mhi_bl_driver = {
++	.id_table = mhi_bl_match_table,
++	.probe = mhi_bl_probe,
++	.remove = mhi_bl_remove,
++	.ul_xfer_cb = mhi_bl_ul_xfer_cb,
++	.dl_xfer_cb = mhi_bl_dl_xfer_cb,
++	.driver = {
++		.name = "mhi_bl_logger",
++	},
++};
++module_mhi_driver(mhi_bl_driver);
++
++MODULE_DESCRIPTION("MHI SBL boot logger client");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/bus/mhi/host/mhi_chan_keepalive.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MHI channel keep-alive client for Qualcomm SDX55 Fusion modem.
++ *
++ * Hypothesis test: vendor DT exposes EFS/QMI1/IP_CTRL channels in AMSS
++ * EE.  Mainline declares them in the channel config but no client
++ * driver binds, so the channels are never STARTed.  Modem firmware
++ * tasks waiting on host-side ring setup may starve and trigger the
++ * per-task DOG watchdog at MISSION+15s (see ~/deepseek-findings.txt).
++ *
++ * This client opens each channel, drains DL traffic, and never queues
++ * UL.  If the +15s ERRFATAL changes timing or disappears, channel
++ * completeness was the gap.
++ */
++
++#include <linux/device.h>
++#include <linux/mhi.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++
++#define MHI_KEEPALIVE_RX_SIZE 0x1000
++
++struct mhi_keepalive_dev {
++	struct mhi_device *mhi_dev;
++	u8 *rx_buf;
++};
++
++static int mhi_keepalive_queue_rx(struct mhi_keepalive_dev *kdev)
++{
++	return mhi_queue_buf(kdev->mhi_dev, DMA_FROM_DEVICE, kdev->rx_buf,
++			     MHI_KEEPALIVE_RX_SIZE, MHI_EOT);
++}
++
++static int mhi_keepalive_probe(struct mhi_device *mhi_dev,
++			       const struct mhi_device_id *id)
++{
++	struct mhi_keepalive_dev *kdev;
++	int ret;
++
++	kdev = devm_kzalloc(&mhi_dev->dev, sizeof(*kdev), GFP_KERNEL);
++	if (!kdev)
++		return -ENOMEM;
++
++	kdev->rx_buf = devm_kzalloc(&mhi_dev->dev, MHI_KEEPALIVE_RX_SIZE,
++				    GFP_KERNEL);
++	if (!kdev->rx_buf)
++		return -ENOMEM;
++
++	kdev->mhi_dev = mhi_dev;
++	dev_set_drvdata(&mhi_dev->dev, kdev);
++
++	ret = mhi_prepare_for_transfer(mhi_dev);
++	if (ret)
++		return ret;
++
++	ret = mhi_keepalive_queue_rx(kdev);
++	if (ret) {
++		mhi_unprepare_from_transfer(mhi_dev);
++		return ret;
++	}
++
++	dev_info(&mhi_dev->dev, "keepalive: %s channel opened\n", id->chan);
++	return 0;
++}
++
++static void mhi_keepalive_remove(struct mhi_device *mhi_dev)
++{
++	mhi_unprepare_from_transfer(mhi_dev);
++}
++
++static void mhi_keepalive_dl_xfer_cb(struct mhi_device *mhi_dev,
++				     struct mhi_result *result)
++{
++	struct mhi_keepalive_dev *kdev = dev_get_drvdata(&mhi_dev->dev);
++
++	if (result->transaction_status)
++		return;
++
++	if (mhi_keepalive_queue_rx(kdev))
++		dev_err(&mhi_dev->dev, "keepalive: failed to requeue RX\n");
++}
++
++static void mhi_keepalive_ul_xfer_cb(struct mhi_device *mhi_dev,
++				     struct mhi_result *result)
++{
++}
++
++/*
++ * EFS is deliberately absent here: the SDX55 firmware is built RMTEFS
++ * ("MPSS...SDX55_RMTEFS_PACK..."), i.e. it expects the AP to host its
++ * filesystem. Merely holding the channel open is not enough - it has to be
++ * serviced. mhi_wwan_ctrl claims EFS instead and exposes /dev/wwan0efs0 so
++ * an EFS sync daemon can implement the protocol in userspace, the way
++ * Android's /vendor/bin/ks does on MHI channel 10.
++ */
++static const struct mhi_device_id mhi_keepalive_match_table[] = {
++	{ .chan = "QMI1" },
++	{ .chan = "IP_CTRL" },
++	{}
++};
++MODULE_DEVICE_TABLE(mhi, mhi_keepalive_match_table);
++
++static struct mhi_driver mhi_keepalive_driver = {
++	.id_table = mhi_keepalive_match_table,
++	.probe = mhi_keepalive_probe,
++	.remove = mhi_keepalive_remove,
++	.ul_xfer_cb = mhi_keepalive_ul_xfer_cb,
++	.dl_xfer_cb = mhi_keepalive_dl_xfer_cb,
++	.driver = {
++		.name = "mhi_chan_keepalive",
++	},
++};
++module_mhi_driver(mhi_keepalive_driver);
++
++MODULE_DESCRIPTION("MHI channel keep-alive for SDX55 Fusion control channels");
++MODULE_LICENSE("GPL");
+--- a/drivers/bus/mhi/host/pci_generic.c
++++ b/drivers/bus/mhi/host/pci_generic.c
+@@ -10,18 +10,37 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/device.h>
++#include <linux/devcoredump.h>
++#include <linux/esoc_client.h>
++#include <linux/iommu.h>
++#include <linux/ktime.h>
+ #include <linux/mhi.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/pci.h>
+ #include <linux/pm_runtime.h>
++#include <linux/gpio/consumer.h>
++#include <linux/of.h>
++#include <linux/sizes.h>
+ #include <linux/timer.h>
++#include <linux/vmalloc.h>
+ #include <linux/workqueue.h>
+ 
+ #define MHI_PCI_DEFAULT_BAR_NUM 0
+ 
+ #define MHI_POST_RESET_DELAY_MS 2000
++#define MHI_LINK_RETRAIN_DELAY_MS 2000
++
++int qcom_pcie_retrain_link(struct pci_dev *pdev);
++int qcom_pcie_perst_toggle(struct pci_dev *pdev);
++int qcom_pcie_relink(struct pci_dev *pdev);
+ 
+ #define HEALTH_CHECK_PERIOD (HZ * 2)
++
++static bool fusion_boot_cycle;
++module_param(fusion_boot_cycle, bool, 0444);
++MODULE_PARM_DESC(fusion_boot_cycle, "Run the vendor-style forced M3+D3hot cycle at mission mode on the SDX55 fusion (lets the modem switch to AMSS PCIe PHY settings)");
++
+ 
+ /* PCI VID definitions */
+ #define PCI_VENDOR_ID_THALES	0x1269
+@@ -47,6 +66,31 @@
+  *		   of inband wake support (such as sdx24)
+  * @no_m3: M3 not supported
+  * @reset_on_remove: Set true for devices that require SoC during driver removal
++ * @async_power_up: Don't wait synchronously for mission mode during probe.
++ *                  Some external-modem setups continue their boot handshake
++ *                  asynchronously after the initial BHI upload.
++ * @early_boot_recovery: Allow the generic health-check timer to force PCI
++ *			 recovery immediately after power-up.
++ * @amss_fw: AMSS firmware path for Sahara-based loading (Fusion modems without
++ *           onboard flash, e.g. SDX55 on Xiaomi Mi 10T).  When set, the path
++ *           is copied to mhi_controller::amss_image so the MHI Sahara driver
++ *           can find it.
++ * @needs_hyp_assign: Set for Fusion modems whose PCIe SID is protected by a
++ *                    TrustZone stage-2 SMMU context bank (SM8250 PCIe2,
++ *                    SID=0x1d01).  mhi_mem_protect() will be called after
++ *                    mhi_prepare_for_power_up() to donate MHI DMA buffers to
++ *                    VMID_MSS_MSA so the modem can write to event rings.
++ * @disable_pm: Keep runtime PM and PCIe link power saving disabled.
++ * @no_link_pm: Disable PCIe link power saving (ASPM) but leave Linux runtime
++ *              PM enabled. Needed for devices whose firmware expects the host
++ *              to cycle the MHI device into M3 when idle (SDX55 fusion) but
++ *              that cannot tolerate autonomous PCIe link low-power states.
++ * @rddm_size: Size in bytes of the RDDM (RAM dump debug mode) buffer that the
++ *             host pre-allocates and exposes to the modem via BHIe RXVEC.
++ *             When non-zero the MHI core auto-allocates rddm_image during
++ *             mhi_prepare_for_power_up(); on a modem crash the host can pull
++ *             the dump out via mhi_download_rddm_image().  Set this for
++ *             devices where post-mortem firmware diagnostics are needed.
+  */
+ struct mhi_pci_dev_info {
+ 	const struct mhi_controller_config *config;
+@@ -54,6 +98,9 @@
+ 	const char *name;
+ 	const char *fw;
+ 	const char *edl;
++	const char *amss_fw;
++	dma_addr_t iova_start;
++	dma_addr_t iova_stop;
+ 	bool edl_trigger;
+ 	unsigned int bar_num;
+ 	unsigned int dma_data_width;
+@@ -62,6 +109,13 @@
+ 	bool sideband_wake;
+ 	bool no_m3;
+ 	bool reset_on_remove;
++	bool async_power_up;
++	bool early_boot_recovery;
++	bool needs_hyp_assign;
++	bool disable_pm;
++	bool no_link_pm;
++	size_t rddm_size;
++	size_t rddm_seg_len;
+ };
+ 
+ #define MHI_CHANNEL_CONFIG_UL(ch_num, ch_name, el_count, ev_ring) \
+@@ -137,6 +191,36 @@
+ 		.doorbell_mode_switch = true,		\
+ 	}
+ 
++#define MHI_CHANNEL_CONFIG_OFFLOAD_UL(ch_num, ch_name, el_count, ev_ring) \
++	{						\
++		.num = ch_num,				\
++		.name = ch_name,			\
++		.num_elements = el_count,		\
++		.event_ring = ev_ring,			\
++		.dir = DMA_TO_DEVICE,			\
++		.ee_mask = BIT(MHI_EE_AMSS),		\
++		.pollcfg = 0,				\
++		.doorbell = MHI_DB_BRST_DISABLE,	\
++		.lpm_notify = false,			\
++		.offload_channel = true,		\
++		.doorbell_mode_switch = false,		\
++	}						\
++
++#define MHI_CHANNEL_CONFIG_OFFLOAD_DL(ch_num, ch_name, el_count, ev_ring) \
++	{						\
++		.num = ch_num,				\
++		.name = ch_name,			\
++		.num_elements = el_count,		\
++		.event_ring = ev_ring,			\
++		.dir = DMA_FROM_DEVICE,			\
++		.ee_mask = BIT(MHI_EE_AMSS),		\
++		.pollcfg = 0,				\
++		.doorbell = MHI_DB_BRST_DISABLE,	\
++		.lpm_notify = false,			\
++		.offload_channel = true,		\
++		.doorbell_mode_switch = false,		\
++	}
++
+ #define MHI_CHANNEL_CONFIG_UL_SBL(ch_num, ch_name, el_count, ev_ring) \
+ 	{						\
+ 		.num = ch_num,				\
+@@ -234,6 +318,20 @@
+ 		.hardware_event = true,		\
+ 		.client_managed = false,	\
+ 		.offload_channel = false,	\
++		.channel = ch_num,		\
++	}
++
++#define MHI_EVENT_CONFIG_OFFLOAD_DATA(ev_ring, el_count, ch_num) \
++	{					\
++		.num_elements = el_count,	\
++		.irq_moderation_ms = 1,		\
++		.irq = (ev_ring) + 1,		\
++		.priority = 1,			\
++		.mode = MHI_DB_BRST_DISABLE,	\
++		.data_type = MHI_ER_DATA,	\
++		.hardware_event = true,		\
++		.client_managed = false,	\
++		.offload_channel = true,	\
+ 		.channel = ch_num,		\
+ 	}
+ 
+@@ -371,6 +469,160 @@
+ 	.event_cfg = modem_qcom_v1_mhi_events,
+ };
+ 
++/* Umi vendor DT exposes SAHARA and QRTR on the external SDX55M. */
++static const struct mhi_channel_config modem_qcom_sdx55_fusion_channels[] = {
++	MHI_CHANNEL_CONFIG_UL_SBL(2, "SAHARA", 128, 1),
++	MHI_CHANNEL_CONFIG_DL_SBL(3, "SAHARA", 128, 1),
++	MHI_CHANNEL_CONFIG_UL(4, "DIAG", 16, 1),
++	MHI_CHANNEL_CONFIG_DL(5, "DIAG", 16, 1),
++	MHI_CHANNEL_CONFIG_UL(10, "EFS", 64, 1),
++	{
++		.num = 11,
++		.name = "EFS",
++		.num_elements = 64,
++		.event_ring = 1,
++		.dir = DMA_FROM_DEVICE,
++		.ee_mask = BIT(MHI_EE_AMSS),
++		.pollcfg = 0,
++		.doorbell = MHI_DB_BRST_DISABLE,
++		.lpm_notify = false,
++		.offload_channel = false,
++		.doorbell_mode_switch = false,
++		.wake_capable = true,
++	},
++	MHI_CHANNEL_CONFIG_UL(12, "MBIM", 4, 0),
++	MHI_CHANNEL_CONFIG_DL(13, "MBIM", 4, 0),
++	MHI_CHANNEL_CONFIG_UL(14, "QMI", 4, 0),
++	MHI_CHANNEL_CONFIG_DL(15, "QMI", 4, 0),
++	MHI_CHANNEL_CONFIG_UL(16, "QMI1", 64, 3),
++	MHI_CHANNEL_CONFIG_DL(17, "QMI1", 64, 3),
++	MHI_CHANNEL_CONFIG_UL(18, "IP_CTRL", 64, 1),
++	MHI_CHANNEL_CONFIG_DL(19, "IP_CTRL", 64, 1),
++	MHI_CHANNEL_CONFIG_UL(20, "IPCR", 8, 0),
++	MHI_CHANNEL_CONFIG_DL(21, "IPCR", 8, 0),
++	{
++		.num = 25,
++		.name = "BL",
++		.num_elements = 32,
++		.event_ring = 1,
++		.dir = DMA_FROM_DEVICE,
++		.ee_mask = BIT(MHI_EE_SBL),
++		.pollcfg = 0,
++		.doorbell = MHI_DB_BRST_DISABLE,
++		.lpm_notify = false,
++		.offload_channel = false,
++		.doorbell_mode_switch = false,
++	},
++	MHI_CHANNEL_CONFIG_UL_FP(34, "FIREHOSE", 32, 0),
++	MHI_CHANNEL_CONFIG_DL_FP(35, "FIREHOSE", 32, 0),
++	MHI_CHANNEL_CONFIG_UL(46, "IP_SW0", 64, 2),
++	MHI_CHANNEL_CONFIG_DL(47, "IP_SW0", 64, 3),
++	MHI_CHANNEL_CONFIG_HW_UL(100, "IP_HW0", 512, 7),
++	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 512, 8),
++	/*
++	 * Call audio. The modem DMAs voice frames straight into memory the DSP
++	 * shares with it, so the host never moves data here; this is an offload
++	 * channel and the core allocates no ring for it.
++	 *
++	 * The vendor device tree declares it bi-directional (mhi_chan@80 in
++	 * kona-mhi.dtsi, mhi,chan-dir = 0). Do not copy that: mhi_create_devices()
++	 * only understands DMA_TO_DEVICE and DMA_FROM_DEVICE, and on anything
++	 * else it logs "Direction not supported" and *returns*, so no device is
++	 * created for this channel or for any channel numbered above it - which
++	 * takes the data path down with it.
++	 *
++	 * Nothing starts this channel by itself: the core never starts offload
++	 * channels, and the satellite is only given event ring 4 and its own
++	 * channels. q6voice-mhi calls mhi_prepare_for_transfer(), which for an
++	 * offload channel sends START_CHAN and allocates nothing.
++	 */
++	MHI_CHANNEL_CONFIG_OFFLOAD_UL(80, "AUDIO_VOICE_0", 64, 0),
++	/*
++	 * Channels lent to the audio DSP so it can drive the modem itself:
++	 * it supplies the ring contexts and rings the doorbells, we only
++	 * proxy the control operations it cannot perform. All four share
++	 * event ring 4, which the DSP owns. See drivers/bus/mhi/host/satellite.c.
++	 */
++	MHI_CHANNEL_CONFIG_OFFLOAD_DL(50, "ADSP_0", 64, 4),
++	MHI_CHANNEL_CONFIG_OFFLOAD_DL(51, "ADSP_1", 64, 4),
++	MHI_CHANNEL_CONFIG_OFFLOAD_DL(70, "ADSP_2", 64, 4),
++	MHI_CHANNEL_CONFIG_OFFLOAD_DL(71, "ADSP_3", 64, 4),
++	MHI_CHANNEL_CONFIG_OFFLOAD_UL(105, "IP_HW_MHIP_0", 512, 11),
++	MHI_CHANNEL_CONFIG_OFFLOAD_DL(106, "IP_HW_MHIP_0", 512, 12),
++	MHI_CHANNEL_CONFIG_OFFLOAD_UL(107, "IP_HW_MHIP_1", 512, 13),
++	MHI_CHANNEL_CONFIG_OFFLOAD_DL(108, "IP_HW_MHIP_1", 512, 14),
++	{
++		.num = 104,
++		.name = "IP_HW0_RSC",
++		.num_elements = 512,
++		.local_elements = 3078,
++		.event_ring = 8,
++		.dir = DMA_FROM_DEVICE,
++		.type = MHI_CH_TYPE_INBOUND_COALESCED,
++		.ee_mask = BIT(MHI_EE_AMSS),
++		.pollcfg = 0,
++		.doorbell = MHI_DB_BRST_ENABLE,
++		.lpm_notify = false,
++		.offload_channel = false,
++		.doorbell_mode_switch = true,
++	},
++	MHI_CHANNEL_CONFIG_UL(109, "RMNET_CTL", 128, 15),
++	MHI_CHANNEL_CONFIG_DL(110, "RMNET_CTL", 128, 16),
++};
++
++/*
++ * SDX55 Fusion firmware is normally paired with the downstream kona MHI
++ * topology. Keep the generic channels, but use vendor-like event rings for
++ * the hardware RMNET path and RMNET_CTL.
++ */
++static struct mhi_event_config modem_qcom_sdx55_fusion_events[] = {
++	MHI_EVENT_CONFIG_CTRL(0, 64),
++	MHI_EVENT_CONFIG_DATA(1, 256),
++	MHI_EVENT_CONFIG_SW_DATA(2, 64),
++	MHI_EVENT_CONFIG_SW_DATA(3, 64),
++	/*
++	 * Event ring for the channels lent to the audio DSP. The DSP installs
++	 * its own context here and consumes the events itself, so the host must
++	 * stay out of it entirely -- offload_channel is what keeps the core from
++	 * claiming an IRQ for it or walking it. Marking it merely client managed
++	 * is not enough: the core would still process the ring and then trip
++	 * over an rp that now points into the DSP's memory.
++	 */
++	{
++		.num_elements = 256,
++		.irq_moderation_ms = 0,
++		.irq = 4 + 1,
++		.priority = 1,
++		.mode = MHI_DB_BRST_DISABLE,
++		.data_type = MHI_ER_DATA,
++		.hardware_event = false,
++		.client_managed = false,
++		.offload_channel = true,
++	},
++	MHI_EVENT_CONFIG_SW_DATA(5, 512),
++	MHI_EVENT_CONFIG_SW_DATA(6, 512),
++	MHI_EVENT_CONFIG_HW_DATA(7, 1024, 100),
++	MHI_EVENT_CONFIG_HW_DATA(8, 2048, 101),
++	MHI_EVENT_CONFIG_HW_DATA(9, 1024, 102),
++	MHI_EVENT_CONFIG_HW_DATA(10, 1024, 103),
++	MHI_EVENT_CONFIG_OFFLOAD_DATA(11, 1024, 105),
++	MHI_EVENT_CONFIG_OFFLOAD_DATA(12, 1024, 106),
++	MHI_EVENT_CONFIG_OFFLOAD_DATA(13, 1024, 107),
++	MHI_EVENT_CONFIG_OFFLOAD_DATA(14, 1024, 108),
++	MHI_EVENT_CONFIG_HW_DATA(15, 1024, 109),
++	MHI_EVENT_CONFIG_HW_DATA(16, 1024, 110),
++};
++
++static const struct mhi_controller_config modem_qcom_sdx55_fusion_config = {
++	.max_channels = 128,
++	.timeout_ms = 60000,
++	.ready_timeout_ms = 50000,
++	.num_channels = ARRAY_SIZE(modem_qcom_sdx55_fusion_channels),
++	.ch_cfg = modem_qcom_sdx55_fusion_channels,
++	.num_events = ARRAY_SIZE(modem_qcom_sdx55_fusion_events),
++	.event_cfg = modem_qcom_sdx55_fusion_events,
++};
++
+ static const struct mhi_pci_dev_info mhi_qcom_sa8775p_info = {
+ 	.name = "qcom-sa8775p",
+ 	.edl_trigger = false,
+@@ -405,8 +657,8 @@
+ 
+ static const struct mhi_pci_dev_info mhi_qcom_sdx55_info = {
+ 	.name = "qcom-sdx55m",
+-	.fw = "qcom/sdx55m/sbl1.mbn",
+-	.edl = "qcom/sdx55m/edl.mbn",
++	.fw = "sdx55m/sbl1.mbn",
++	.edl = "sdx55m/edl.mbn",
+ 	.edl_trigger = true,
+ 	.config = &modem_qcom_v1_mhiv_config,
+ 	.bar_num = MHI_PCI_DEFAULT_BAR_NUM,
+@@ -423,6 +675,71 @@
+ 	.mru_default = 32768,
+ 	.sideband_wake = false,
+ 	.edl_trigger = true,
++};
++
++/*
++ * Qualcomm SDX55M in Fusion configuration (e.g. Xiaomi Mi 10T / Umi).
++ *
++ * BHI loads sbl1.mbn. The vendor DT programs the modem's S1-translated IOVA
++ * pool as <0x20000000 0x1fffffff>, but the downstream MHI controller sets the
++ * advertised start address to 0 and the stop address to pool_end. Mirror that
++ * here so the MHI context registers match the vendor SDX55 setup.
++ *
++ * qcom_scm_assign_mem() (needs_hyp_assign) returns -EINVAL on Umi's SM8250
++ * TZ firmware, so skip it; the SMMU stage-1 IOVA mapping is sufficient for
++ * the modem to DMA-read the BHI image. After SBL the esoc driver
++ * (qcom,ext-sdx55m) resets the modem via SPMI PON so it boots AMSS from
++ * internal NAND.
++ */
++static const struct mhi_pci_dev_info mhi_qcom_sdx55_fusion_info = {
++	.name = "qcom-sdx55m-fusion",
++	.fw = "sdx55m/sbl1.mbn",
++	.edl = "sdx55m/edl.mbn",
++	.amss_fw = "sdx55m/multi_image.mbn",
++	.iova_start = 0,
++	.iova_stop = 0x3fffffff,
++	.edl_trigger = true,
++	.config = &modem_qcom_sdx55_fusion_config,
++	.bar_num = MHI_PCI_DEFAULT_BAR_NUM,
++	/*
++	 * Align with every other SDX55-family entry (regular sdx55, sdx65,
++	 * sdx75, telit, foxconn, quectel): 32-bit DMA.  IOVA pool is capped
++	 * at 0x3fffffff so addresses already fit in 32 bits; setting
++	 * dma_data_width=64 was making MHI core write non-zero high-address
++	 * halves to registers the modem treats as reserved.
++	 */
++	.dma_data_width = 32,
++	.mru_default = 32768,
++	.sideband_wake = false,
++	.async_power_up = true,
++	.early_boot_recovery = true,
++	.needs_hyp_assign = false,
++	/*
++	 * Leave PCIe ASPM alone — all other mainline SDX55 variants allow it
++	 * (no_link_pm = false).  The previous comment speculated the fusion
++	 * firmware couldn't tolerate L1/L1SS, but the ERRFATAL fires at a
++	 * variable ~12-15s regardless of link state, which doesn't match a
++	 * link-PM-sensitivity bug.  Revert to the default so the idle
++	 * autosuspend path runs like on working SDX55 boards.
++	 */
++	.no_link_pm = false,
++	/*
++	 * Enable RDDM (RAM dump debug mode) capture.  Was previously disabled
++	 * because at the +15s ERRFATAL baseline (dummy EFS) the modem hadn't
++	 * advanced far enough to complete a BHIe RDDM transfer and the dump
++	 * pull stalled the ESOC crash path.  With real EFS in place the modem
++	 * stays in MISSION until a deliberate ERRFATAL from a deeper code
++	 * path (e.g. xiaomi_extend uninitialized SIM dispatcher), so the
++	 * BHIe transfer completes and the dump is informative — it captures
++	 * the firmware function that triggered the fault, callsite chain,
++	 * and the dispatcher table state we suspect is uninitialized.
++	 *
++	 * 64 MB total in 64 KB segments (1024 mhi_buf allocations).  Typical
++	 * SDX55 RDDM dumps are 30-100 MB; 64 MB gives partial coverage with
++	 * a small enough total footprint to allocate reliably on the phone.
++	 */
++	.rddm_size = 64 * 1024 * 1024,
++	.rddm_seg_len = 0x10000,
+ };
+ 
+ static const struct mhi_pci_dev_info mhi_qcom_sdx24_info = {
+@@ -462,6 +779,7 @@
+ static const struct mhi_controller_config modem_quectel_em1xx_config = {
+ 	.max_channels = 128,
+ 	.timeout_ms = 20000,
++	.ready_timeout_ms = 50000,
+ 	.num_channels = ARRAY_SIZE(mhi_quectel_em1xx_channels),
+ 	.ch_cfg = mhi_quectel_em1xx_channels,
+ 	.num_events = ARRAY_SIZE(mhi_quectel_em1xx_events),
+@@ -961,8 +1279,6 @@
+ 		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx35_info },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_QCOM, 0x0304),
+ 		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx24_info },
+-	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0306, PCI_VENDOR_ID_QCOM, 0x010c),
+-		.driver_data = (kernel_ulong_t) &mhi_foxconn_sdx55_info },
+ 	/* EM919x (sdx55), use the same vid:pid as qcom-sdx55m */
+ 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0306, 0x18d7, 0x0200),
+ 		.driver_data = (kernel_ulong_t) &mhi_sierra_em919x_info },
+@@ -972,6 +1288,10 @@
+ 	/* Telit FN980 hardware revision v1 */
+ 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0306, 0x1C5D, 0x2000),
+ 		.driver_data = (kernel_ulong_t) &mhi_telit_fn980_hw_v1_info },
++	/* SDX55 Fusion (no onboard flash): Qualcomm subsystem ID 0x010c,
++	 * seen on e.g. Xiaomi Mi 10T (Umi). AMSS loaded via Sahara. */
++	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0306, PCI_VENDOR_ID_QCOM, 0x010c),
++		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx55_fusion_info },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_QCOM, 0x0306),
+ 		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx55_info },
+ 	/* Telit FN990 */
+@@ -1085,16 +1405,42 @@
+ enum mhi_pci_device_status {
+ 	MHI_PCI_DEV_STARTED,
+ 	MHI_PCI_DEV_SUSPENDED,
+-};
++	MHI_PCI_DEV_LINK_RETRAIN_PENDING,
++	MHI_PCI_DEV_AUTOSUSPEND_SET,
++	MHI_PCI_DEV_SYS_SUSPEND,	/* inside system (not runtime) suspend */
++	MHI_PCI_DEV_FUSION_MHI_ONLY,	/* suspended at MHI level only, still D0 */
++};
++
++/*
++ * MSI polling interval: On Qualcomm SM8250, when the endpoint's IOMMU domain
++ * is DMA-translated (not identity), DW PCIe iMSI-RX cannot catch MSI TLPs
++ * because the SMMU TBU sits in the inbound path before iMSI-RX.  This timer
++ * polls event rings to compensate for the missing MSI delivery.
++ */
++#define MHI_MSI_POLL_INTERVAL_MS	2
+ 
+ struct mhi_pci_device {
++	struct gpio_desc *wake_gpio;
++	int wake_irq;
+ 	struct mhi_controller mhi_cntrl;
+ 	struct pci_saved_state *pci_state;
+ 	struct work_struct recovery_work;
++	struct delayed_work link_retrain_work;
++	struct delayed_work pm_probe_work;
++	int pm_probe_iter;
+ 	struct timer_list health_check_timer;
++	struct timer_list msi_poll_timer;
++	bool msi_poll_enabled;
++	bool msi_poll_saw_m0;
+ 	unsigned long status;
+ 	bool reset_on_remove;
+-};
++	const struct mhi_pci_dev_info *info;
++	struct esoc_desc *esoc_client;
++	struct esoc_client_hook esoc_hook;
++};
++
++static int mhi_pci_power_up(struct mhi_pci_device *mhi_pdev);
++static void mhi_pci_start_msi_poll(struct mhi_pci_device *mhi_pdev);
+ 
+ static int mhi_pci_read_reg(struct mhi_controller *mhi_cntrl,
+ 			    void __iomem *addr, u32 *out)
+@@ -1109,20 +1455,284 @@
+ 	writel(val, addr);
+ }
+ 
++/*
++ * Linearise the modem's RDDM (RAM dump debug mode) image into a vmalloc
++ * buffer and hand it to devcoredump so the user can pull the dump from
++ * /sys/class/devcoredump/.  Also log the first 256 bytes via hex dump so the
++ * crash header is visible directly in dmesg without copying files.
++ *
++ * Caller must guarantee BHIe RX vector status is XFER_COMPL (i.e.
++ * mhi_download_rddm_image() returned 0) before calling this.
++ */
++static void mhi_pci_collect_rddm(struct mhi_controller *mhi_cntrl)
++{
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	struct image_info *img = mhi_cntrl->rddm_image;
++	size_t total = 0, copied = 0;
++	struct mhi_buf *mhi_buf;
++	void *dump;
++	u32 i;
++
++	if (!img || !img->entries) {
++		dev_warn(&pdev->dev, "RDDM: no image buffer to collect\n");
++		return;
++	}
++
++	/* Last entry is the BHI vector table itself, skip it. */
++	for (i = 0; i < img->entries - 1; i++)
++		total += img->mhi_buf[i].len;
++
++	if (!total) {
++		dev_warn(&pdev->dev, "RDDM: image buffer is empty\n");
++		return;
++	}
++
++	dump = vmalloc(total);
++	if (!dump) {
++		dev_warn(&pdev->dev,
++			 "RDDM: vmalloc(%zu) failed, dropping dump\n", total);
++		return;
++	}
++
++	mhi_buf = img->mhi_buf;
++	for (i = 0; i < img->entries - 1; i++, mhi_buf++) {
++		memcpy((u8 *)dump + copied, mhi_buf->buf, mhi_buf->len);
++		copied += mhi_buf->len;
++	}
++
++	dev_info(&pdev->dev, "RDDM: collected %zu bytes from modem\n", copied);
++	print_hex_dump(KERN_INFO, "rddm-head: ", DUMP_PREFIX_OFFSET, 16, 1,
++		       dump, min_t(size_t, copied, 256), true);
++
++	/* dev_coredumpv takes ownership of the vmalloc'd buffer */
++	dev_coredumpv(&pdev->dev, dump, copied, GFP_KERNEL);
++}
++
++/*
++ * Out-of-band wake from the modem. On this platform the endpoint cannot
++ * signal in-band from D3hot (MSIs do not traverse the SMMU into iMSI-RX,
++ * PME is unwired), so a runtime-suspended modem that gets paged has no
++ * way to ask for the host - it starves and takes a fatal error. The
++ * SDX55 asserts PCIE_WAKE# (tlmm 87) instead, exactly what the vendor
++ * driver listens for.
++ */
++static irqreturn_t mhi_pci_wake_irq(int irq, void *data)
++{
++	struct mhi_pci_device *mhi_pdev = data;
++	struct device *dev = mhi_pdev->mhi_cntrl.cntrl_dev;
++
++	pm_wakeup_event(dev, 0);
++	pm_request_resume(dev);
++
++	return IRQ_HANDLED;
++}
++
++static void mhi_pci_setup_fusion_wake(struct pci_dev *pdev,
++				      struct mhi_pci_device *mhi_pdev)
++{
++	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
++	struct device_node *np;
++	int ret;
++
++	if (mhi_pdev->wake_gpio || !bridge || !bridge->dev.parent)
++		return;
++
++	np = bridge->dev.parent->of_node;
++	if (!np)
++		return;
++
++	mhi_pdev->wake_gpio = devm_fwnode_gpiod_get(&pdev->dev,
++						    of_fwnode_handle(np),
++						    "wake", GPIOD_IN,
++						    "mhi-modem-wake");
++	if (IS_ERR(mhi_pdev->wake_gpio)) {
++		dev_info(&pdev->dev, "no usable wake GPIO (%ld)\n",
++			 PTR_ERR(mhi_pdev->wake_gpio));
++		mhi_pdev->wake_gpio = NULL;
++		return;
++	}
++
++	mhi_pdev->wake_irq = gpiod_to_irq(mhi_pdev->wake_gpio);
++	if (mhi_pdev->wake_irq < 0)
++		return;
++
++	ret = devm_request_threaded_irq(&pdev->dev, mhi_pdev->wake_irq, NULL,
++					mhi_pci_wake_irq,
++					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++					"mhi-modem-wake", mhi_pdev);
++	if (ret) {
++		dev_warn(&pdev->dev, "wake IRQ request failed: %d\n", ret);
++		return;
++	}
++
++	enable_irq_wake(mhi_pdev->wake_irq);
++	dev_info(&pdev->dev, "modem WAKE# wired (gpio irq %d)\n",
++		 mhi_pdev->wake_irq);
++}
++
+ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
+ 			      enum mhi_callback cb)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	struct mhi_pci_device *mhi_pdev = pci_get_drvdata(pdev);
+ 
+ 	/* Nothing to do for now */
+ 	switch (cb) {
++	case MHI_CB_EE_RDDM:
++		dev_warn(&pdev->dev,
++			 "modem entered RDDM, downloading crash dump\n");
++		if (!mhi_download_rddm_image(mhi_cntrl, false))
++			mhi_pci_collect_rddm(mhi_cntrl);
++		else
++			dev_warn(&pdev->dev,
++				 "RDDM: BHIe download failed\n");
++		pm_runtime_forbid(&pdev->dev);
++		break;
+ 	case MHI_CB_FATAL_ERROR:
+ 	case MHI_CB_SYS_ERROR:
+ 		dev_warn(&pdev->dev, "firmware crashed (%u)\n", cb);
+ 		pm_runtime_forbid(&pdev->dev);
+ 		break;
+ 	case MHI_CB_EE_MISSION_MODE:
+-		pm_runtime_allow(&pdev->dev);
++		/*
++		 * Downstream mhi_qcom forces a suspend/resume cycle at mission
++		 * mode so the modem can switch to AMSS PCIe PHY settings.
++		 *
++		 * This runs BEFORE mhi_create_devices() so pending_pkts == 0
++		 * and the suspend won't be refused.
++		 */
++		if (mhi_pdev && mhi_pdev->info &&
++		    ((mhi_pdev->info->async_power_up &&
++		      mhi_pdev->info != &mhi_qcom_sdx55_fusion_info) ||
++		     (fusion_boot_cycle &&
++		      mhi_pdev->info == &mhi_qcom_sdx55_fusion_info))) {
++			int ret, retries = 0;
++			struct pci_saved_state *saved_state = NULL;
++
++			do {
++				ret = mhi_pm_suspend(mhi_cntrl);
++				if (ret == -EBUSY) {
++					msleep(100);
++					retries++;
++				}
++			} while (ret == -EBUSY && retries < 10);
++
++			if (!ret) {
++				dev_info(&pdev->dev,
++					 "mission mode: M3 OK (retries=%d), cycling D3hot\n",
++					 retries);
++
++				pci_clear_master(pdev);
++				ret = pci_save_state(pdev);
++				if (ret)
++					dev_warn(&pdev->dev,
++						 "mission mode: pci_save_state failed: %d\n",
++						 ret);
++				else
++					saved_state = pci_store_saved_state(pdev);
++				pci_disable_device(pdev);
++				pci_set_power_state(pdev, PCI_D3hot);
++
++				msleep(250);
++
++				pci_set_power_state(pdev, PCI_D0);
++				if (pci_enable_device(pdev))
++					dev_warn(&pdev->dev,
++						 "mission mode: pci_enable_device failed\n");
++				if (saved_state) {
++					ret = pci_load_and_free_saved_state(pdev,
++									    &saved_state);
++					if (ret)
++						dev_warn(&pdev->dev,
++							 "mission mode: pci_load_and_free_saved_state failed: %d\n",
++							 ret);
++				}
++				pci_restore_state(pdev);
++				pci_set_master(pdev);
++
++				ret = mhi_pm_resume(mhi_cntrl);
++				if (ret)
++					dev_warn(&pdev->dev,
++						 "mission mode: MHI resume failed: %d\n",
++						 ret);
++				else
++					dev_info(&pdev->dev,
++						 "mission mode: D3hot cycle complete\n");
++			} else {
++				dev_warn(&pdev->dev,
++					 "mission mode: MHI suspend failed: %d (retries=%d)\n",
++					 ret, retries);
++			}
++		}
++
++		/*
++		 * Some fusion setups need PCIe ASPM disabled even in mission
++		 * mode. Respect the device policy from probe.
++		 */
++		if (mhi_pdev && mhi_pdev->info &&
++		    (mhi_pdev->info->disable_pm || mhi_pdev->info->no_link_pm)) {
++			pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
++			dev_info(&pdev->dev,
++				 "mission mode: keeping PCIe link power saving disabled\n");
++		}
++
++		if (mhi_pdev && mhi_pdev->info && mhi_pdev->info->disable_pm) {
++			pm_runtime_forbid(&pdev->dev);
++			dev_info(&pdev->dev,
++				 "mission mode: keeping runtime PM forbidden (disable_pm)\n");
++		} else if (mhi_pdev && mhi_pdev->info == &mhi_qcom_sdx55_fusion_info &&
++			   !fusion_boot_cycle) {
++			/*
++			 * SDX55 fusion modems crash with ERRFATAL ~5 s into
++			 * mhi_pm_suspend (MCFG refresh timer watchdog fires
++			 * while the host is blocked waiting for M3 acknowledgement).
++			 * Forbid runtime PM entirely — the modem stays in M0.
++			 */
++			pm_runtime_forbid(&pdev->dev);
++			dev_info(&pdev->dev,
++				 "mission mode: forbidding runtime PM to prevent ERRFATAL on SDX55 fusion\n");
++		} else if (mhi_pdev && mhi_pdev->info && !mhi_pdev->info->no_m3 &&
++			   mhi_pdev->esoc_client &&
++			   pci_pme_capable(pdev, PCI_D3hot) &&
++			   !test_and_set_bit(MHI_PCI_DEV_AUTOSUSPEND_SET,
++					     &mhi_pdev->status)) {
++			/*
++			 * ESOC-client path: the direct-probe autosuspend block
++			 * at the bottom of mhi_pci_probe() is unreachable here
++			 * because probe returns early when an ESOC client is
++			 * registered.  Mirror that autosuspend setup now.
++			 *
++			 * Mirror the non-ESOC probe-end autosuspend setup now.
++			 * We previously only called pm_runtime_allow() here,
++			 * which left usage_count stuck at 1 on Umi and
++			 * prevented the idle M3 autosuspend transition from
++			 * ever arming. Drop the count explicitly after allowing
++			 * runtime PM, just like the normal probe path does.
++			 */
++			mhi_pci_setup_fusion_wake(pdev, mhi_pdev);
++			pm_runtime_set_autosuspend_delay(&pdev->dev, 5000);
++			pm_runtime_use_autosuspend(&pdev->dev);
++			pm_runtime_mark_last_busy(&pdev->dev);
++			pm_runtime_allow(&pdev->dev);
++			pm_runtime_put_noidle(&pdev->dev);
++			dev_info(&pdev->dev,
++				 "mission mode: enabled runtime PM autosuspend (5000ms), usage=%d\n",
++				 atomic_read(&pdev->dev.power.usage_count));
++			schedule_delayed_work(&mhi_pdev->pm_probe_work,
++				      msecs_to_jiffies(100));
++		}
++		break;
++	case MHI_CB_IDLE:
++		/*
++		 * Downstream mhi_qcom uses this callback to explicitly kick
++		 * runtime PM autosuspend.  MHI core fires MHI_CB_IDLE when
++		 * the device transitions M1→M2 and has no pending packets or
++		 * wake assertions.  Without this, the firmware's idle watchdog
++		 * fires because the host never drives the M3 suspend that the
++		 * autosuspend timer would trigger.
++		 */
++		pm_runtime_mark_last_busy(&pdev->dev);
++		pm_request_autosuspend(&pdev->dev);
+ 		break;
+ 	default:
+ 		break;
+@@ -1187,6 +1797,63 @@
+ 	pci_set_master(pdev);
+ 
+ 	return 0;
++}
++
++/*
++ * On Qualcomm SM8250, the SMMU TBU sits between the PCIe endpoint and the DW
++ * PCIe iMSI-RX module.  When the endpoint's IOMMU domain is DMA-translated
++ * (not identity), MSI TLPs carry an address the SMMU has no mapping for and
++ * they fault.  Identity-map the MSI target page so the write reaches the
++ * iMSI-RX address comparator.
++ *
++ * Must run after the endpoint's MSI capability has been programmed, i.e. after
++ * pci_alloc_irq_vectors() -- the target address is read back out of it.
++ */
++static void mhi_pci_map_msi_page(struct pci_dev *pdev)
++{
++	struct iommu_domain *domain;
++	int msi_cap;
++	int err;
++
++	domain = iommu_get_domain_for_dev(&pdev->dev);
++	msi_cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
++	if (domain && msi_cap) {
++		u32 addr_lo = 0, addr_hi = 0;
++		u16 msi_flags = 0;
++		phys_addr_t msi_page;
++
++		pci_read_config_dword(pdev, msi_cap + PCI_MSI_ADDRESS_LO,
++				      &addr_lo);
++		pci_read_config_word(pdev, msi_cap + PCI_MSI_FLAGS,
++				     &msi_flags);
++		if (msi_flags & PCI_MSI_FLAGS_64BIT)
++			pci_read_config_dword(pdev,
++					      msi_cap + PCI_MSI_ADDRESS_HI,
++					      &addr_hi);
++
++		msi_page = (((phys_addr_t)addr_hi << 32) | addr_lo) & PAGE_MASK;
++		if (msi_page && iommu_iova_to_phys(domain, msi_page) == msi_page) {
++			/* already identity-mapped, e.g. across a link rebuild */
++			dev_dbg(&pdev->dev,
++				"MSI target page 0x%pa already mapped\n",
++				&msi_page);
++		} else if (msi_page) {
++			err = iommu_map(domain, msi_page, msi_page, PAGE_SIZE,
++					IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO,
++					GFP_KERNEL);
++			if (err && err != -EEXIST)
++				dev_warn(&pdev->dev,
++					 "Failed to map MSI page 0x%pa in SMMU: %d\n",
++					 &msi_page, err);
++			else
++				dev_info(&pdev->dev,
++					 "MSI target page 0x%pa mapped in SMMU domain (type %d)\n",
++					 &msi_page, domain->type);
++		} else {
++			dev_warn(&pdev->dev,
++				 "endpoint MSI address is zero, MSIs will fault\n");
++		}
++	}
+ }
+ 
+ static int mhi_pci_get_irqs(struct mhi_controller *mhi_cntrl,
+@@ -1234,7 +1901,7 @@
+ 	return 0;
+ }
+ 
+-static int mhi_pci_runtime_get(struct mhi_controller *mhi_cntrl)
++static int mhi_pci_runtime_get(struct mhi_controller *mhi_cntrl, void *priv)
+ {
+ 	/* The runtime_get() MHI callback means:
+ 	 *    Do whatever is requested to leave M3.
+@@ -1242,7 +1909,7 @@
+ 	return pm_runtime_get(mhi_cntrl->cntrl_dev);
+ }
+ 
+-static void mhi_pci_runtime_put(struct mhi_controller *mhi_cntrl)
++static void mhi_pci_runtime_put(struct mhi_controller *mhi_cntrl, void *priv)
+ {
+ 	/* The runtime_put() MHI callback means:
+ 	 *    Device can be moved in M3 state.
+@@ -1251,6 +1918,751 @@
+ 	pm_runtime_put(mhi_cntrl->cntrl_dev);
+ }
+ 
++static u64 mhi_pci_time_get(struct mhi_controller *mhi_cntrl, void *priv)
++{
++	return ktime_get_boottime_ns() / NSEC_PER_USEC;
++}
++
++static int mhi_pci_lpm_disable(struct mhi_controller *mhi_cntrl, void *priv)
++{
++	return 0;
++}
++
++static int mhi_pci_lpm_enable(struct mhi_controller *mhi_cntrl, void *priv)
++{
++	return 0;
++}
++
++static enum pci_bus_speed mhi_pci_to_pcie_speed(u32 target)
++{
++	switch (target) {
++	case 1:
++		return PCIE_SPEED_2_5GT;
++	case 2:
++		return PCIE_SPEED_5_0GT;
++	case 3:
++		return PCIE_SPEED_8_0GT;
++	case 4:
++		return PCIE_SPEED_16_0GT;
++	case 5:
++		return PCIE_SPEED_32_0GT;
++	case 6:
++		return PCIE_SPEED_64_0GT;
++	default:
++		return PCI_SPEED_UNKNOWN;
++	}
++}
++
++static int mhi_pci_bw_scale(struct mhi_controller *mhi_cntrl,
++			    struct mhi_link_info *link_info)
++{
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	struct pci_dev *bridge = pci_upstream_bridge(pdev);
++	enum pci_bus_speed speed;
++	int ret;
++
++	speed = mhi_pci_to_pcie_speed(link_info->target_link_speed);
++	if (speed == PCI_SPEED_UNKNOWN) {
++		dev_warn(&pdev->dev,
++			 "BW_REQ: unsupported speed encoding %u (width %u)\n",
++			 link_info->target_link_speed,
++			 link_info->target_link_width);
++		return -EINVAL;
++	}
++
++	if (!bridge) {
++		dev_info(&pdev->dev,
++			 "BW_REQ: no upstream bridge, ignoring request speed=%u width=%u\n",
++			 link_info->target_link_speed,
++			 link_info->target_link_width);
++		return 0;
++	}
++
++	ret = pcie_set_target_speed(bridge, speed, false);
++	if (ret)
++		dev_warn(&pdev->dev,
++			 "BW_REQ: failed to set target speed=%u width=%u on %s: %d\n",
++			 link_info->target_link_speed, link_info->target_link_width,
++			 pci_name(bridge), ret);
++	else
++		dev_info(&pdev->dev,
++			 "BW_REQ: requested speed=%u width=%u via %s\n",
++			 link_info->target_link_speed, link_info->target_link_width,
++			 pci_name(bridge));
++
++	return ret;
++}
++
++/*
++ * Periodic diagnostic probe scheduled from mission-mode entry.
++ *
++ * Logs PCI runtime PM state, MHI dev_wake / pending_pkts, and current MHI
++ * execution environment for several seconds after mission mode is entered,
++ * so we can see why autosuspend isn't driving the device to M3 before the
++ * firmware idle watchdog fires.
++ */
++static void mhi_pci_pm_probe_work(struct work_struct *work)
++{
++	struct mhi_pci_device *mhi_pdev = container_of(to_delayed_work(work),
++						       struct mhi_pci_device,
++						       pm_probe_work);
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	struct device *dev = &pdev->dev;
++	dev_info(dev,
++		 "pm_probe[%d]: usage=%d disable_depth=%d runtime_status=%d "
++		 "dev_wake=%d pending_pkts=%d ee=0x%x dev_state=0x%x\n",
++		 mhi_pdev->pm_probe_iter,
++		 atomic_read(&dev->power.usage_count),
++		 dev->power.disable_depth,
++		 dev->power.runtime_status,
++		 atomic_read(&mhi_cntrl->dev_wake),
++		 atomic_read(&mhi_cntrl->pending_pkts),
++		 (unsigned int)mhi_cntrl->ee,
++		 (unsigned int)mhi_cntrl->dev_state);
++
++	/*
++	 * Only force a single early M3 proof cycle. Repeating it during active
++	 * IPCR/DIAG bring-up perturbs the very traffic we're trying to observe.
++	 */
++	if (mhi_pdev->pm_probe_iter == 0) {
++		int ret = mhi_pm_suspend(mhi_cntrl);
++
++		if (!ret) {
++			msleep(50);
++			ret = mhi_pm_resume(mhi_cntrl);
++			dev_info(dev, "pm_probe[%d]: forced M3 cycle OK, resume=%d\n",
++				 mhi_pdev->pm_probe_iter, ret);
++
++			/*
++			 * Keep exactly one proven M3 cycle then pin the link
++			 * back in M0. Testing confirmed the post-mission
++			 * ERRFATAL timing is invariant to runtime PM state
++			 * (identical crash time with continuous M3 cycling or
++			 * no further cycles), so long-lived M3 is neither
++			 * required nor harmful — just leave the link in the
++			 * simplest state.
++			 */
++			if (!ret && mhi_pdev->info == &mhi_qcom_sdx55_fusion_info) {
++				pm_runtime_forbid(dev);
++				dev_info(dev,
++					 "pm_probe[%d]: disabled runtime PM after one successful M3 cycle on SDX55 fusion\n",
++					 mhi_pdev->pm_probe_iter);
++			}
++		} else {
++			dev_info(dev, "pm_probe[%d]: forced M3 failed: %d\n",
++				 mhi_pdev->pm_probe_iter, ret);
++		}
++	}
++
++	mhi_pdev->pm_probe_iter++;
++	if (mhi_pdev->pm_probe_iter < 20)
++		schedule_delayed_work(&mhi_pdev->pm_probe_work,
++				      msecs_to_jiffies(1000));
++}
++
++/*
++ * Link retrain work — runs ~3 seconds after BHI firmware loading.
++ *
++ * On Fusion modems (e.g. SDX55M on SM8250/Umi) the modem drops the PCIe
++ * link when SBL transitions to AMSS boot from internal NAND.  The vendor
++ * kernel handles this by doing a full PCIe disable/enable cycle with PERST#
++ * toggle ~2 s after BHI.  We replicate that here: check if the link died,
++ * toggle PERST# via the Qcom PCIe driver, then re-initialise MHI.
++ */
++static void mhi_pci_link_retrain_work(struct work_struct *work)
++{
++	struct mhi_pci_device *mhi_pdev = container_of(work, struct mhi_pci_device,
++						       link_retrain_work.work);
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	int err;
++
++	clear_bit(MHI_PCI_DEV_LINK_RETRAIN_PENDING, &mhi_pdev->status);
++
++	/* If device is alive, the modem booted without dropping the link */
++	if (mhi_pci_is_alive(mhi_cntrl)) {
++		dev_dbg(&pdev->dev, "link retrain: device is alive, nothing to do\n");
++		return;
++	}
++
++	dev_info(&pdev->dev, "link retrain: device unreachable after BHI, retraining PCIe link\n");
++
++	/* Clean up MHI state from the failed first attempt */
++	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
++		mhi_power_down(mhi_cntrl, false);
++		mhi_unprepare_after_power_down(mhi_cntrl);
++	}
++
++	/* Toggle PERST# and retrain the link */
++	err = qcom_pcie_retrain_link(pdev);
++	if (err) {
++		dev_err(&pdev->dev, "link retrain: PCIe link retrain failed: %d\n", err);
++		return;
++	}
++
++	/* Restore PCI state and re-enable the device */
++	pci_load_saved_state(pdev, mhi_pdev->pci_state);
++	pci_restore_state(pdev);
++
++	if (!mhi_pci_is_alive(mhi_cntrl)) {
++		dev_err(&pdev->dev, "link retrain: device still unreachable after retrain\n");
++		return;
++	}
++
++	/* Dump raw MMIO registers via BAR0 to diagnose modem state */
++	{
++		void __iomem *base = mhi_cntrl->regs;
++		u32 mhiver, mhicfg, mhictrl, mhistatus, bhioff, bhiever;
++		u32 bhiee, bhiimgaddr_lo, bhiimgaddr_hi, bhiimgsize, bhistatus;
++
++		mhiver    = base ? ioread32(base + 0x00) : 0xdead0000;
++		mhicfg    = base ? ioread32(base + 0x10) : 0xdead0010;
++		mhictrl   = base ? ioread32(base + 0x38) : 0xdead0038;
++		mhistatus = base ? ioread32(base + 0x48) : 0xdead0048;
++		bhioff    = base ? ioread32(base + 0x28) : 0xdead0028;
++		dev_info(&pdev->dev,
++			 "link retrain: MMIO regs: MHIVER=0x%x MHICFG=0x%x MHICTRL=0x%x MHISTATUS=0x%x BHIOFF=0x%x\n",
++			 mhiver, mhicfg, mhictrl, mhistatus, bhioff);
++
++		if (base && bhioff < 0x1000) {
++			bhiee         = ioread32(base + bhioff + 0x28);
++			bhiever       = ioread32(base + bhioff + 0x2c);
++			bhiimgaddr_lo = ioread32(base + bhioff + 0x18);
++			bhiimgaddr_hi = ioread32(base + bhioff + 0x1c);
++			bhiimgsize    = ioread32(base + bhioff + 0x20);
++			bhistatus     = ioread32(base + bhioff + 0x30);
++			dev_info(&pdev->dev,
++				 "link retrain: BHI regs: EXECENV=0x%x EXECENVVER=0x%x IMGADDR=0x%x%08x IMGSIZE=0x%x STATUS=0x%x\n",
++				 bhiee, bhiever, bhiimgaddr_hi, bhiimgaddr_lo,
++				 bhiimgsize, bhistatus);
++		}
++	}
++
++	/*
++	 * The modem is booting AMSS from internal NAND.  Wait for it to
++	 * bring up its MHI endpoint and reach Mission Mode before we
++	 * re-initialise the host side, otherwise MHI will try to BHI-load
++	 * SBL again and fail.
++	 */
++	err = mhi_prepare_for_power_up(mhi_cntrl);
++	if (err) {
++		dev_err(&pdev->dev, "link retrain: failed to prepare MHI: %d\n", err);
++		return;
++	}
++
++	{
++		enum mhi_ee_type ee;
++		int wait_ms = 10000;
++
++		dev_info(&pdev->dev, "link retrain: waiting for modem to reach AMSS\n");
++		do {
++			msleep(100);
++			wait_ms -= 100;
++			ee = mhi_get_exec_env(mhi_cntrl);
++		} while (ee != MHI_EE_AMSS && wait_ms > 0);
++
++		if (ee != MHI_EE_AMSS) {
++			dev_err(&pdev->dev,
++				"link retrain: modem did not reach AMSS (EE=%d), powering up anyway\n",
++				ee);
++		} else {
++			dev_info(&pdev->dev, "link retrain: modem reached AMSS\n");
++		}
++	}
++
++	err = mhi_pci_power_up(mhi_pdev);
++	if (err) {
++		dev_err(&pdev->dev, "link retrain: failed to power up MHI: %d\n", err);
++		mhi_unprepare_after_power_down(mhi_cntrl);
++		return;
++	}
++
++	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
++	dev_info(&pdev->dev, "link retrain: MHI re-initialised successfully\n");
++}
++
++/*
++ * Wait up to 5 s for the modem's PCIe endpoint to answer config reads again
++ * after a reset.  pci_enable_device() is retried until it succeeds because
++ * the D3cold->D0 platform transition only completes once the endpoint is
++ * alive.  Returns true once the endpoint responds.
++ */
++/*
++ * Wait for the modem's config space to answer again.
++ *
++ * After a crash the PCIe link really is down, so the modem has to boot far
++ * enough to bring its own PCIe up and re-train before anything here responds.
++ * That takes considerably longer than the ~0 ms seen at cold boot, where a PON
++ * warm reset only restarts the modem's compute side and leaves the link alone.
++ * Being impatient here is actively harmful: the caller's fallback is to pulse
++ * PERST#, which resets a modem that was merely still booting.
++ */
++static bool mhi_pci_wait_endpoint_timeout(struct pci_dev *pdev, int timeout_ms)
++{
++	bool enabled = false;
++	int retries;
++	u16 vendor;
++	int err;
++
++	for (retries = 0; retries < timeout_ms / 100; retries++) {
++		/*
++		 * Probe config space directly. Reads only need a trained link,
++		 * whereas pci_enable_device() is about BAR decoding and can
++		 * fail for its own reasons -- gating the probe on it would
++		 * report a dark endpoint without ever having looked at one.
++		 */
++		vendor = 0xffff;
++		pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor);
++		if (vendor != 0xffff && vendor != 0x0000) {
++			if (!enabled) {
++				err = pci_enable_device(pdev);
++				if (err) {
++					dev_warn(&pdev->dev,
++						 "endpoint answers (vendor %#06x) but enable failed: %d\n",
++						 vendor, err);
++					return false;
++				}
++				pci_set_master(pdev);
++				enabled = true;
++			}
++			dev_info(&pdev->dev,
++				 "modem PCIe endpoint ready after ~%d ms\n",
++				 retries * 100);
++			return true;
++		}
++		msleep(100);
++	}
++
++	/* Balance our own enable so the refcount stays sane on failure */
++	if (enabled)
++		pci_disable_device(pdev);
++
++	dev_warn(&pdev->dev, "modem PCIe endpoint still dark after %d ms\n",
++		 timeout_ms);
++
++	return false;
++}
++
++/*
++ * Bring MHI up on a modem whose sideband is already asserted.
++ *
++ * Shared by the ESOC power-on hook and by a probe that re-enumerated in the
++ * middle of a power-on cycle: in both cases AP2MDM_STATUS is high and the
++ * modem is waiting for the host to start talking to it.
++ */
++static int mhi_pci_esoc_bringup(struct mhi_pci_device *mhi_pdev)
++{
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	int err;
++
++	err = mhi_prepare_for_power_up(mhi_cntrl);
++	if (err)
++		return err;
++
++	if (mhi_cntrl->rddm_size)
++		dev_info(&pdev->dev,
++			 "RDDM buffer allocated: size=%zu seg_len=%zu image=%s\n",
++			 mhi_cntrl->rddm_size, mhi_cntrl->rddm_seg_len,
++			 mhi_cntrl->rddm_image ? "ok" : "MISSING");
++
++	if (mhi_pdev->info->needs_hyp_assign) {
++		err = mhi_mem_protect(mhi_cntrl);
++		if (err)
++			dev_warn(&pdev->dev,
++				 "MHI DMA donation to modem VMID failed (%d), proceeding\n",
++				 err);
++	}
++
++	err = mhi_pci_power_up(mhi_pdev);
++	if (err) {
++		mhi_unprepare_after_power_down(mhi_cntrl);
++		return err;
++	}
++
++	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
++	mhi_pci_start_msi_poll(mhi_pdev);
++
++	/* Schedule link retrain check for fusion modems that may drop PCIe */
++	if (mhi_pdev->info->async_power_up) {
++		set_bit(MHI_PCI_DEV_LINK_RETRAIN_PENDING, &mhi_pdev->status);
++		schedule_delayed_work(&mhi_pdev->link_retrain_work,
++				      msecs_to_jiffies(MHI_LINK_RETRAIN_DELAY_MS));
++	}
++
++	return 0;
++}
++
++/*
++ * Re-enumerate the modem after its PCIe link has been rebuilt.
++ *
++ * Removing and rescanning is the standard way to get a device fully
++ * re-initialised: the PCI core tears down the old pci_dev and the subsequent
++ * scan probes a fresh one, so MSI, the SMMU mappings and the MHI controller
++ * are all built from scratch rather than patched up.
++ *
++ * Runs from a worker because the caller is the device's own ESOC power-on
++ * callback: removing the device there would free the memory it is executing
++ * against.
++ */
++struct mhi_pci_reprobe {
++	struct work_struct work;
++	struct pci_dev *pdev;
++};
++
++/* Slot currently being re-enumerated; only ever set across pci_rescan_bus(). */
++static struct pci_bus *mhi_pci_reprobe_bus;
++static unsigned int mhi_pci_reprobe_devfn;
++
++/*
++ * True for the one probe that the re-enumeration above is responsible for.
++ * Consumed on read: a later probe of the same slot is an ordinary one.
++ */
++static bool mhi_pci_take_reprobe(struct pci_dev *pdev)
++{
++	if (pdev->bus != mhi_pci_reprobe_bus ||
++	    pdev->devfn != mhi_pci_reprobe_devfn)
++		return false;
++
++	mhi_pci_reprobe_bus = NULL;
++	return true;
++}
++
++static void mhi_pci_reprobe_work(struct work_struct *work)
++{
++	struct mhi_pci_reprobe *rp = container_of(work, struct mhi_pci_reprobe,
++						  work);
++	struct pci_dev *pdev = rp->pdev;
++	struct pci_bus *bus = pdev->bus;
++	unsigned int devfn = pdev->devfn;
++
++	dev_info(&pdev->dev, "re-enumerating after link rebuild\n");
++
++	pci_lock_rescan_remove();
++	pci_stop_and_remove_bus_device(pdev);
++
++	/*
++	 * pci_rescan_bus() probes synchronously under this lock, so marking
++	 * the slot here and clearing it right after is enough for probe to
++	 * recognise its own re-enumeration without the flag ever outliving it.
++	 */
++	mhi_pci_reprobe_bus = bus;
++	mhi_pci_reprobe_devfn = devfn;
++	pci_rescan_bus(bus);
++	mhi_pci_reprobe_bus = NULL;
++
++	pci_unlock_rescan_remove();
++
++	pci_dev_put(pdev);
++	kfree(rp);
++}
++
++static void mhi_pci_schedule_reprobe(struct pci_dev *pdev)
++{
++	struct mhi_pci_reprobe *rp;
++
++	rp = kzalloc(sizeof(*rp), GFP_KERNEL);
++	if (!rp) {
++		dev_err(&pdev->dev, "cannot schedule re-enumeration\n");
++		return;
++	}
++
++	rp->pdev = pci_dev_get(pdev);
++	INIT_WORK(&rp->work, mhi_pci_reprobe_work);
++	schedule_work(&rp->work);
++}
++
++static int mhi_pci_esoc_power_on(void *priv, unsigned int flags)
++{
++	struct mhi_pci_device *mhi_pdev = priv;
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	int err;
++
++	if (test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status))
++		return 0;
++
++	dev_info(&pdev->dev, "ESOC requested MHI power on (flags=0x%x)\n", flags);
++
++	/*
++	 * Re-allow runtime PM that was forbidden in esoc_power_off to
++	 * keep the device out of D3cold across the warm-reset cycle.
++	 */
++	pm_runtime_allow(&pdev->dev);
++
++	/*
++	 * Hold a PM reference so that autosuspend does not fire
++	 * while we wait for the modem PBL to initialise.
++	 */
++	pm_runtime_get_noresume(&pdev->dev);
++
++	/*
++	 * The SPMI warm reset just rebooted the modem.  Before its
++	 * PBL can initialise the PCIe endpoint, the host PCIe
++	 * controller must be out of D3cold so the refclk is
++	 * running.  Trigger runtime resume now — it may fail
++	 * (D3cold→D0 verifies PMCSR which needs a live endpoint)
++	 * but the platform power-up (clocks, PHY, genpd) succeeds
++	 * regardless.
++	 *
++	 * Save whether the device was suspended before the resume
++	 * attempt so we know whether the runtime-PM callback ran.
++	 */
++	{
++		bool was_suspended = test_bit(MHI_PCI_DEV_SUSPENDED,
++					      &mhi_pdev->status);
++
++		pm_runtime_resume(&pdev->dev);
++
++		/*
++		 * The resume callback's error path queues recovery_work
++		 * which would fight us.  Cancel it.
++		 */
++		cancel_work_sync(&mhi_pdev->recovery_work);
++
++		if (was_suspended) {
++			/*
++			 * The runtime resume callback fired and cleared
++			 * MHI_PCI_DEV_SUSPENDED, but pci_enable_device()
++			 * inside it likely failed (endpoint not alive).
++			 * The platform clocks/refclk are up though.
++			 */
++		} else {
++			/*
++			 * Device was not suspended — either first boot
++			 * (still D0 from probe) or PM compiled out.
++			 * Enable manually so clocks are on.
++			 */
++			err = pci_enable_device(pdev);
++			if (!err)
++				pci_set_master(pdev);
++		}
++	}
++
++	/*
++	 * Poll until the modem PBL boots and its PCIe endpoint responds.
++	 *
++	 * Only at the very first power-on is the link already up from PCI
++	 * enumeration, and there this answers in ~0 ms. After any shutdown --
++	 * graceful restart just as much as a crash -- the link is genuinely
++	 * down and the modem has to boot far enough to bring its own PCIe back
++	 * up and re-train, which takes seconds. Waiting is free when the
++	 * endpoint is already alive, so be patient on every path: being
++	 * impatient here just means resetting a modem that was still booting.
++	 */
++	if (!mhi_pci_wait_endpoint_timeout(pdev, 30000)) {
++		/*
++		 * Endpoint stayed dark.  As a last resort toggle PERST# to
++		 * cold-reset the modem down to PBL so it re-enumerates like
++		 * first boot.  That resets the endpoint's config space, so
++		 * the saved BAR assignment has to be restored afterwards.
++		 *
++		 * This is worth trying however we got here: a graceful restart
++		 * leaves the link just as dead as a crash does, and refusing to
++		 * try the one recovery mechanism available simply because the
++		 * modem did not crash means the port never comes back.
++		 *
++		 * Rebuilding the controller is what the vendor stack does here
++		 * (msm_pcie_pm_control(MSM_PCIE_RESUME) followed by a fresh
++		 * probe), and qcom_pcie_relink() is the mainline equivalent:
++		 * the same host_deinit()/host_init() pair the controller's own
++		 * resume path uses. It refuses unless the link is already
++		 * down, which is what makes it safe -- tearing the resources
++		 * out from under a live device is what hung the AP when this
++		 * was attempted by hand via qcom_pcie_retrain_link().
++		 */
++		dev_info(&pdev->dev,
++			 "endpoint dark after reset, rebuilding PCIe link\n");
++		err = qcom_pcie_relink(pdev);
++		if (err) {
++			dev_err(&pdev->dev,
++				"link rebuild failed: %d, falling back to PERST#\n",
++				err);
++			err = qcom_pcie_perst_toggle(pdev);
++			if (err)
++				dev_err(&pdev->dev,
++					"PERST# toggle failed: %d, continuing anyway\n",
++					err);
++		}
++
++		/* PERST# drops it all the way to PBL, so allow a full boot */
++		if (!mhi_pci_wait_endpoint_timeout(pdev, 30000))
++			goto err_no_endpoint;
++
++		/*
++		 * The link is back, but everything the endpoint learned at
++		 * probe is gone with it: config space, MSI, and the DMA
++		 * mappings the modem needs to fetch its own boot image. Trying
++		 * to restore those one by one is a losing game -- fixing MSI
++		 * just moves the failure to the next thing probe did.
++		 *
++		 * Do what the vendor stack does after resuming the link
++		 * (msm_pcie_pm_control(MSM_PCIE_RESUME) then mhi_pci_probe):
++		 * throw the device away and enumerate it again, so probe
++		 * rebuilds all of it. That cannot happen from here -- we are
++		 * running inside this device's own ESOC callback and the
++		 * remove would free the structures underneath us -- so hand it
++		 * to a worker and return.
++		 */
++		dev_info(&pdev->dev,
++			 "link rebuilt, re-enumerating device to rebuild state\n");
++		pm_runtime_put_noidle(&pdev->dev);
++		mhi_pci_schedule_reprobe(pdev);
++		return 0;
++	}
++
++	/* Release the extra PM reference */
++	pm_runtime_put_noidle(&pdev->dev);
++
++	return mhi_pci_esoc_bringup(mhi_pdev);
++
++err_no_endpoint:
++	dev_err(&pdev->dev, "modem PCIe endpoint did not respond after reset\n");
++	pm_runtime_put_noidle(&pdev->dev);
++	return -ETIMEDOUT;
++}
++
++static void mhi_pci_esoc_power_off(void *priv, unsigned int flags)
++{
++	struct mhi_pci_device *mhi_pdev = priv;
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	bool graceful = !(flags & ESOC_HOOK_MDM_CRASH);
++
++	cancel_delayed_work_sync(&mhi_pdev->link_retrain_work);
++	timer_delete_sync(&mhi_pdev->msi_poll_timer);
++	mhi_pdev->msi_poll_enabled = false;
++
++	if (!test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status))
++		return;
++
++	/*
++	 * MDM2AP_ERRFATAL fired and ESOC is tearing the modem down. Pull the
++	 * RDDM dump out via BHIe before we power the link off so we can see
++	 * what the modem actually crashed on. Use the non-panic path: we run
++	 * from the mdm_drv workqueue, so the panic path's udelay() polling
++	 * loops (up to timeout_ms ~= 30s) would starve the CPU and trigger
++	 * an RCU stall. wait_event_timeout() sleeps instead.
++	 */
++	if (!graceful) {
++		if (mhi_cntrl->rddm_image) {
++			dev_warn(&pdev->dev,
++				 "ESOC reported modem crash, pulling RDDM dump\n");
++			if (!mhi_download_rddm_image(mhi_cntrl, false))
++				mhi_pci_collect_rddm(mhi_cntrl);
++			else
++				dev_warn(&pdev->dev,
++					 "RDDM: BHIe download failed after ERRFATAL\n");
++		} else {
++			dev_warn(&pdev->dev,
++				 "ESOC reported modem crash, skipping RDDM and powering down\n");
++		}
++	}
++
++	mhi_power_down(mhi_cntrl, graceful);
++	mhi_unprepare_after_power_down(mhi_cntrl);
++
++	/*
++	 * Prevent runtime PM autosuspend from calling pci_disable_device()
++	 * while ESOC is about to warm-reset the modem.  If the device enters
++	 * D3cold before the recovery reset, the D3cold→D0 transition will
++	 * fail because the modem endpoint is dead — and on ARM64/DT platforms
++	 * the platform power transition is a no-op, so there is no way to
++	 * re-enable the link without a live endpoint.  Keeping the device in
++	 * D0 across the reset cycle avoids this entirely.
++	 */
++	pm_runtime_forbid(&pdev->dev);
++}
++
++static int mhi_pci_register_esoc(struct mhi_pci_device *mhi_pdev)
++{
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	struct esoc_desc *desc;
++	int err;
++
++	if (!pdev->dev.of_node || !of_property_present(pdev->dev.of_node, "esoc-0"))
++		return 0;
++
++	desc = devm_register_esoc_client(&pdev->dev, "mdm");
++	if (IS_ERR(desc))
++		return PTR_ERR(desc);
++	if (!desc)
++		return 0;
++
++	mhi_pdev->esoc_client = desc;
++	mhi_pdev->esoc_hook.priv = mhi_pdev;
++	mhi_pdev->esoc_hook.prio = ESOC_MHI_HOOK;
++	mhi_pdev->esoc_hook.esoc_link_power_on = mhi_pci_esoc_power_on;
++	mhi_pdev->esoc_hook.esoc_link_power_off = mhi_pci_esoc_power_off;
++
++	err = esoc_register_client_hook(desc, &mhi_pdev->esoc_hook);
++	if (err)
++		return err;
++
++	pci_d3cold_disable(pdev);
++	dev_info(&pdev->dev, "registered modem ESOC hook from DT node\n");
++
++	return 0;
++}
++
++static void mhi_pci_apply_dt_pre_register(struct mhi_pci_device *mhi_pdev)
++{
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	struct device_node *np = pdev->dev.of_node;
++	struct device_node *iommu_np;
++	const char *iommu_dma_type;
++	u32 addr_win[2];
++	bool use_s1 = true;
++
++	if (!np)
++		return;
++
++	iommu_np = of_parse_phandle(np, "qcom,iommu-group", 0);
++	if (!iommu_np)
++		return;
++
++	if (!of_property_read_string(iommu_np, "qcom,iommu-dma", &iommu_dma_type) &&
++	    !strcmp(iommu_dma_type, "bypass"))
++		use_s1 = false;
++
++	if (use_s1 &&
++	    !of_property_read_u32_array(iommu_np, "qcom,iommu-dma-addr-pool",
++					addr_win, ARRAY_SIZE(addr_win))) {
++		mhi_cntrl->iova_start = 0;
++		mhi_cntrl->iova_stop = (dma_addr_t)addr_win[0] + addr_win[1];
++		dev_info(&pdev->dev,
++			 "using DT IOVA window start=0x%llx stop=0x%llx\n",
++			 (unsigned long long)mhi_cntrl->iova_start,
++			 (unsigned long long)mhi_cntrl->iova_stop);
++	}
++
++	of_node_put(iommu_np);
++}
++
++static void mhi_pci_apply_dt_post_register(struct mhi_pci_device *mhi_pdev)
++{
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	struct device_node *np = pdev->dev.of_node;
++	u32 val;
++
++	if (!np)
++		return;
++
++	if (!of_property_read_u32(np, "mhi,timeout", &val)) {
++		mhi_cntrl->timeout_ms = val;
++		dev_info(&pdev->dev, "using DT MHI timeout %u ms\n", val);
++	}
++
++	if (!of_property_read_u32(np, "mhi,buffer-len", &val)) {
++		mhi_cntrl->buffer_len = val;
++		dev_info(&pdev->dev, "using DT MHI buffer length 0x%x\n", val);
++	}
++}
++
+ static void mhi_pci_recovery_work(struct work_struct *work)
+ {
+ 	struct mhi_pci_device *mhi_pdev = container_of(work, struct mhi_pci_device,
+@@ -1261,6 +2673,11 @@
+ 
+ 	dev_warn(&pdev->dev, "device recovery started\n");
+ 
++	if (!mhi_pdev->info->early_boot_recovery) {
++		dev_info(&pdev->dev, "skipping generic recovery for this controller\n");
++		return;
++	}
++
+ 	if (!pdev->is_virtfn)
+ 		timer_delete(&mhi_pdev->health_check_timer);
+ 
+@@ -1283,13 +2700,22 @@
+ 	if (err)
+ 		goto err_try_reset;
+ 
+-	err = mhi_sync_power_up(mhi_cntrl);
++	if (mhi_pdev->info->needs_hyp_assign) {
++		err = mhi_mem_protect(mhi_cntrl);
++		if (err)
++			dev_warn(&pdev->dev,
++				 "MHI DMA donation to modem VMID failed (%d), proceeding\n",
++				 err);
++	}
++
++	err = mhi_pci_power_up(mhi_pdev);
+ 	if (err)
+ 		goto err_unprepare;
+ 
+ 	dev_dbg(&pdev->dev, "Recovery completed\n");
+ 
+ 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
++	mhi_pci_start_msi_poll(mhi_pdev);
+ 
+ 	if (!pdev->is_virtfn)
+ 		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
+@@ -1316,12 +2742,79 @@
+ 
+ 	if (!mhi_pci_is_alive(mhi_cntrl)) {
+ 		dev_err(mhi_cntrl->cntrl_dev, "Device died\n");
++		if (mhi_pdev->info->early_boot_recovery)
++			queue_work(system_long_wq, &mhi_pdev->recovery_work);
++		else
++			dev_info(mhi_cntrl->cntrl_dev,
++				 "Skipping generic recovery for transient modem disappearance\n");
++		return;
++	}
++
++	/* reschedule in two seconds */
++	mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
++}
++
++static void mhi_pci_msi_poll(struct timer_list *t)
++{
++	struct mhi_pci_device *mhi_pdev = timer_container_of(mhi_pdev, t,
++							     msi_poll_timer);
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	enum mhi_state hw_state;
++
++	if (!mhi_pdev->msi_poll_enabled)
++		return;
++
++	/* Always reschedule first — ensures the timer never silently dies */
++	mod_timer(&mhi_pdev->msi_poll_timer,
++		  jiffies + msecs_to_jiffies(MHI_MSI_POLL_INTERVAL_MS));
++
++	/*
++	 * Check HW state BEFORE the STARTED gate — MHI core error handling
++	 * may clear STARTED when it detects stale state, but we still need
++	 * to detect modem reboot (M0->RESET) to trigger recovery.
++	 */
++	hw_state = mhi_get_mhi_state(mhi_cntrl);
++
++	if (hw_state == MHI_STATE_M0)
++		mhi_pdev->msi_poll_saw_m0 = true;
++
++	if (hw_state == MHI_STATE_RESET && mhi_pdev->msi_poll_saw_m0) {
++		dev_info(mhi_cntrl->cntrl_dev,
++			 "MHI M0->RESET detected by poll timer, scheduling recovery\n");
++		mhi_pdev->msi_poll_enabled = false;
++		mhi_pdev->msi_poll_saw_m0 = false;
+ 		queue_work(system_long_wq, &mhi_pdev->recovery_work);
+ 		return;
+ 	}
+ 
+-	/* reschedule in two seconds */
+-	mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
++	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) ||
++	    test_bit(MHI_PCI_DEV_SUSPENDED, &mhi_pdev->status))
++		return;
++
++	mhi_poll_events(mhi_cntrl);
++}
++
++static void mhi_pci_start_msi_poll(struct mhi_pci_device *mhi_pdev)
++{
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct iommu_domain *domain;
++
++	domain = iommu_get_domain_for_dev(mhi_cntrl->cntrl_dev);
++	if (!domain || domain->type == IOMMU_DOMAIN_IDENTITY ||
++	    domain->type == IOMMU_DOMAIN_BLOCKED) {
++		dev_dbg(mhi_cntrl->cntrl_dev,
++			"IOMMU domain type %d, MSI polling not needed\n",
++			domain ? domain->type : -1);
++		return;
++	}
++
++	dev_info(mhi_cntrl->cntrl_dev,
++		 "IOMMU DMA domain detected (type %d), enabling MSI poll timer (%d ms)\n",
++		 domain->type, MHI_MSI_POLL_INTERVAL_MS);
++	mhi_pdev->msi_poll_enabled = true;
++	mhi_pdev->msi_poll_saw_m0 = false;
++	mod_timer(&mhi_pdev->msi_poll_timer,
++		  jiffies + msecs_to_jiffies(MHI_MSI_POLL_INTERVAL_MS));
+ }
+ 
+ static int mhi_pci_generic_edl_trigger(struct mhi_controller *mhi_cntrl)
+@@ -1338,7 +2831,7 @@
+ 	}
+ 
+ 	pm_wakeup_event(&mhi_cntrl->mhi_dev->dev, 0);
+-	mhi_cntrl->runtime_get(mhi_cntrl);
++	mhi_cntrl->runtime_get(mhi_cntrl, mhi_cntrl->priv_data);
+ 
+ 	ret = mhi_get_channel_doorbell_offset(mhi_cntrl, &val);
+ 	if (ret)
+@@ -1352,10 +2845,26 @@
+ 	mhi_soc_reset(mhi_cntrl);
+ 
+ err_get_chdb:
+-	mhi_cntrl->runtime_put(mhi_cntrl);
++	mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
+ 	mhi_device_put(mhi_cntrl->mhi_dev);
+ 
+ 	return ret;
++}
++
++static int mhi_pci_power_up(struct mhi_pci_device *mhi_pdev)
++{
++	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++	int err;
++
++	if (mhi_pdev->info->async_power_up) {
++		err = mhi_async_power_up(mhi_cntrl);
++		if (!err)
++			dev_info(&pdev->dev, "MHI controller started asynchronously\n");
++		return err;
++	}
++
++	return mhi_sync_power_up(mhi_cntrl);
+ }
+ 
+ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -1375,6 +2884,9 @@
+ 		return -ENOMEM;
+ 
+ 	INIT_WORK(&mhi_pdev->recovery_work, mhi_pci_recovery_work);
++	INIT_DELAYED_WORK(&mhi_pdev->link_retrain_work, mhi_pci_link_retrain_work);
++	INIT_DELAYED_WORK(&mhi_pdev->pm_probe_work, mhi_pci_pm_probe_work);
++	timer_setup(&mhi_pdev->msi_poll_timer, mhi_pci_msi_poll, 0);
+ 
+ 	if (pdev->is_virtfn && info->vf_config)
+ 		mhi_cntrl_config = info->vf_config;
+@@ -1386,23 +2898,38 @@
+ 		timer_setup(&mhi_pdev->health_check_timer, health_check, 0);
+ 
+ 	mhi_cntrl = &mhi_pdev->mhi_cntrl;
++	mhi_pdev->info = info;
+ 
+ 	dma_data_width = (pdev->is_virtfn && info->vf_dma_data_width) ?
+ 			  info->vf_dma_data_width : info->dma_data_width;
+ 
+ 	mhi_cntrl->cntrl_dev = &pdev->dev;
+-	mhi_cntrl->iova_start = 0;
+-	mhi_cntrl->iova_stop = (dma_addr_t)DMA_BIT_MASK(dma_data_width);
++	if (info->iova_stop) {
++		mhi_cntrl->iova_start = info->iova_start;
++		mhi_cntrl->iova_stop = info->iova_stop;
++	} else {
++		mhi_cntrl->iova_start = 0;
++		mhi_cntrl->iova_stop = (dma_addr_t)DMA_BIT_MASK(dma_data_width);
++	}
++	mhi_pci_apply_dt_pre_register(mhi_pdev);
+ 	mhi_cntrl->fw_image = info->fw;
+ 	mhi_cntrl->edl_image = info->edl;
++	mhi_cntrl->amss_image = info->amss_fw;
+ 
+ 	mhi_cntrl->read_reg = mhi_pci_read_reg;
+ 	mhi_cntrl->write_reg = mhi_pci_write_reg;
+ 	mhi_cntrl->status_cb = mhi_pci_status_cb;
+ 	mhi_cntrl->runtime_get = mhi_pci_runtime_get;
+ 	mhi_cntrl->runtime_put = mhi_pci_runtime_put;
++	mhi_cntrl->time_get = mhi_pci_time_get;
++	mhi_cntrl->lpm_disable = mhi_pci_lpm_disable;
++	mhi_cntrl->lpm_enable = mhi_pci_lpm_enable;
++	mhi_cntrl->bw_scale = mhi_pci_bw_scale;
++	mhi_cntrl->priv_data = mhi_pdev;
+ 	mhi_cntrl->mru = info->mru_default;
+ 	mhi_cntrl->name = info->name;
++	mhi_cntrl->rddm_size = info->rddm_size;
++	mhi_cntrl->rddm_seg_len = info->rddm_seg_len;
+ 
+ 	if (!pdev->is_virtfn)
+ 		mhi_pdev->reset_on_remove = info->reset_on_remove;
+@@ -1420,9 +2947,54 @@
+ 	if (err)
+ 		return err;
+ 
++	/*
++	 * Constrain the DMA mask to match the modem's IOVA window.
++	 * The IOMMU DMA allocator uses the DMA mask to bound IOVA
++	 * allocation.  Without this, a 64-bit mask lets the allocator
++	 * place buffers at ~0xffffe000, far above the modem's
++	 * [iova_start, iova_stop] window, causing the modem to crash.
++	 */
++	if (info->iova_stop) {
++		err = dma_set_mask_and_coherent(&pdev->dev, info->iova_stop);
++		if (err) {
++			dev_err(&pdev->dev, "Cannot set DMA mask to 0x%llx: %d\n",
++				(unsigned long long)info->iova_stop, err);
++			return err;
++		}
++		dev_info(&pdev->dev, "DMA mask constrained to 0x%llx for modem IOVA window\n",
++			 (unsigned long long)info->iova_stop);
++	}
++
++	/*
++	 * NOTE: A previous 2MB identity mapping at 0xaf800000 was removed
++	 * (it was added for SBL DMA faults, which are now fixed by the DMA
++	 * mask constraint above).  A targeted per-page MSI identity mapping
++	 * is created later, after mhi_pci_get_irqs() programs the EP's MSI
++	 * capability registers with the iMSI-RX target address.
++	 */
++
++	if (info->disable_pm || info->no_link_pm) {
++		pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
++		dev_info(&pdev->dev, "disabled PCIe link power saving\n");
++	}
++	if (info->disable_pm) {
++		pm_runtime_forbid(&pdev->dev);
++		dev_info(&pdev->dev, "forbade runtime PM (disable_pm)\n");
++	}
++
+ 	err = mhi_pci_get_irqs(mhi_cntrl, mhi_cntrl_config);
+ 	if (err)
+ 		return err;
++
++	/*
++	 * On Qualcomm SM8250, the SMMU TBU sits between the PCIe endpoint
++	 * and the DW PCIe iMSI-RX module.  When the endpoint's IOMMU domain
++	 * is DMA-translated (not identity), MSI TLPs carry an address that
++	 * the SMMU has no mapping for, causing translation faults.  Create
++	 * an identity mapping for the MSI target page so the SMMU passes
++	 * the MSI write through to the iMSI-RX address comparator.
++	 */
++	mhi_pci_map_msi_page(pdev);
+ 
+ 	pci_set_drvdata(pdev, mhi_pdev);
+ 
+@@ -1437,6 +3009,41 @@
+ 	if (err)
+ 		return err;
+ 
++	mhi_pci_apply_dt_post_register(mhi_pdev);
++
++	err = mhi_pci_register_esoc(mhi_pdev);
++	if (err)
++		goto err_unregister;
++
++	/*
++	 * When an ESOC client is registered the modem sideband (AP2MDM_STATUS)
++	 * is controlled by the ESOC/remoteproc driver.  Powering up MHI here
++	 * (before AP2MDM_STATUS=1) causes BHI to fail: the modem PBL rejects
++	 * the firmware upload (error 0xef120700) because AP2MDM_STATUS is still
++	 * low.  Defer the entire prepare+power_up sequence to the ESOC
++	 * esoc_link_power_on hook, which fires after ESOC_PWR_ON has driven
++	 * AP2MDM_STATUS high.
++	 */
++	if (mhi_pdev->esoc_client) {
++		/*
++		 * A re-enumeration triggered from the power-on hook is the
++		 * exception: that hook has already run for this cycle and will
++		 * not run again, so nothing else would ever start us.
++		 */
++		if (mhi_pci_take_reprobe(pdev)) {
++			dev_info(&pdev->dev,
++				 "re-probed during ESOC power-on, starting MHI now\n");
++			err = mhi_pci_esoc_bringup(mhi_pdev);
++			if (err)
++				goto err_unregister;
++			return 0;
++		}
++
++		dev_info(&pdev->dev,
++			 "ESOC client registered, deferring MHI power-up to ESOC hook\n");
++		return 0;
++	}
++
+ 	/* MHI bus does not power up the controller by default */
+ 	err = mhi_prepare_for_power_up(mhi_cntrl);
+ 	if (err) {
+@@ -1444,20 +3051,37 @@
+ 		goto err_unregister;
+ 	}
+ 
+-	err = mhi_async_power_up(mhi_cntrl);
++	/*
++	 * On SM8250 with external SDX55M on PCIe2, TZ stage-2 SMMU (CB=12,
++	 * SID=0x1d01) may block modem DMA writes to host memory.  Attempt to
++	 * donate MHI control-path DMA buffers to VMID_MSS_MSA.  Non-fatal:
++	 * the call fails with -EINVAL on platforms where the stage-2 SMMU
++	 * protection is not actually enabled and the modem works without it.
++	 */
++	if (info->needs_hyp_assign) {
++		err = mhi_mem_protect(mhi_cntrl);
++		if (err)
++			dev_warn(&pdev->dev,
++				 "MHI DMA donation to modem VMID failed (%d), proceeding\n",
++				 err);
++	}
++
++	err = mhi_pci_power_up(mhi_pdev);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "failed to power up MHI controller\n");
+ 		goto err_unprepare;
+ 	}
+ 
+ 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
++	mhi_pci_start_msi_poll(mhi_pdev);
+ 
+ 	/* start health check */
+-	if (!pdev->is_virtfn)
++	if (!pdev->is_virtfn && info->early_boot_recovery)
+ 		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
+ 
+ 	/* Allow runtime suspend only if both PME from D3Hot and M3 are supported */
+-	if (pci_pme_capable(pdev, PCI_D3hot) && !(info->no_m3)) {
++	if (!info->disable_pm &&
++	    pci_pme_capable(pdev, PCI_D3hot) && !(info->no_m3)) {
+ 		pm_runtime_set_autosuspend_delay(&pdev->dev, 2000);
+ 		pm_runtime_use_autosuspend(&pdev->dev);
+ 		pm_runtime_mark_last_busy(&pdev->dev);
+@@ -1469,6 +3093,8 @@
+ err_unprepare:
+ 	mhi_unprepare_after_power_down(mhi_cntrl);
+ err_unregister:
++	if (mhi_pdev->esoc_client)
++		esoc_unregister_client_hook(mhi_pdev->esoc_client, &mhi_pdev->esoc_hook);
+ 	mhi_unregister_controller(mhi_cntrl);
+ 
+ 	return err;
+@@ -1484,19 +3110,30 @@
+ 
+ 	if (!pdev->is_virtfn)
+ 		timer_delete_sync(&mhi_pdev->health_check_timer);
++	timer_delete_sync(&mhi_pdev->msi_poll_timer);
+ 	cancel_work_sync(&mhi_pdev->recovery_work);
++	cancel_delayed_work_sync(&mhi_pdev->link_retrain_work);
++	cancel_delayed_work_sync(&mhi_pdev->pm_probe_work);
+ 
+ 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
+ 		mhi_power_down(mhi_cntrl, true);
+ 		mhi_unprepare_after_power_down(mhi_cntrl);
+ 	}
+ 
+-	/* balancing probe put_noidle */
+-	if (pci_pme_capable(pdev, PCI_D3hot))
++	/* Balance the usage_count decrement from probe/mission-mode.
++	 * Non-ESOC: pm_runtime_put_noidle at probe end.
++	 * ESOC: pm_runtime_allow at mission-mode entry.
++	 */
++	if (test_bit(MHI_PCI_DEV_AUTOSUSPEND_SET, &mhi_pdev->status))
++		pm_runtime_forbid(&pdev->dev);
++	else if (pci_pme_capable(pdev, PCI_D3hot))
+ 		pm_runtime_get_noresume(&pdev->dev);
+ 
+ 	if (mhi_pdev->reset_on_remove)
+ 		mhi_soc_reset(mhi_cntrl);
++
++	if (mhi_pdev->esoc_client)
++		esoc_unregister_client_hook(mhi_pdev->esoc_client, &mhi_pdev->esoc_hook);
+ 
+ 	mhi_unregister_controller(mhi_cntrl);
+ }
+@@ -1552,7 +3189,15 @@
+ 		return;
+ 	}
+ 
+-	err = mhi_sync_power_up(mhi_cntrl);
++	if (mhi_pdev->info->needs_hyp_assign) {
++		err = mhi_mem_protect(mhi_cntrl);
++		if (err)
++			dev_warn(&pdev->dev,
++				 "MHI DMA donation to modem VMID failed (%d), proceeding\n",
++				 err);
++	}
++
++	err = mhi_pci_power_up(mhi_pdev);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "failed to power up MHI controller\n");
+ 		mhi_unprepare_after_power_down(mhi_cntrl);
+@@ -1560,7 +3205,8 @@
+ 	}
+ 
+ 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
+-	if (!pdev->is_virtfn)
++	mhi_pci_start_msi_poll(mhi_pdev);
++	if (!pdev->is_virtfn && mhi_pdev->info->early_boot_recovery)
+ 		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
+ }
+ 
+@@ -1574,6 +3220,17 @@
+ 
+ 	if (state == pci_channel_io_perm_failure)
+ 		return PCI_ERS_RESULT_DISCONNECT;
++
++	/*
++	 * For fusion modems (async_power_up), the PCIe link drop during
++	 * SBL→AMSS transition is expected.  Prevent the error recovery from
++	 * doing a secondary bus reset which would cold-reset the modem back
++	 * to PBL.  The link_retrain_work will handle recovery.
++	 */
++	if (test_bit(MHI_PCI_DEV_LINK_RETRAIN_PENDING, &mhi_pdev->status)) {
++		dev_info(&pdev->dev, "link retrain pending, skipping PCI error recovery\n");
++		return PCI_ERS_RESULT_RECOVERED;
++	}
+ 
+ 	/* Clean up MHI state */
+ 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
+@@ -1616,12 +3273,84 @@
+ 	.reset_done = mhi_pci_reset_done,
+ };
+ 
++/*
++ * The modem takes a fatal error if M3 freezes it while the ADSP is
++ * still (re)binding its satellite channels; require thirty quiet
++ * seconds on the satellite links before offering M3.
++ */
++static bool fusion_m3;
++module_param(fusion_m3, bool, 0644);
++MODULE_PARM_DESC(fusion_m3, "Attempt MHI M3 across suspend on the SDX55 fusion (EXPERIMENTAL: the modem has taken ERRFATAL ~60ms after M3 entry even on a settled satellite link)");
++
++extern unsigned long mhi_sat_last_transition_jiffies;
++
++static bool mhi_sat_settled(void)
++{
++	unsigned long last = READ_ONCE(mhi_sat_last_transition_jiffies);
++
++	return !last || time_after(jiffies, last + 30 * HZ);
++}
++
+ static int  __maybe_unused mhi_pci_runtime_suspend(struct device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct mhi_pci_device *mhi_pdev = dev_get_drvdata(dev);
+ 	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+ 	int err;
++
++	/*
++	 * Runtime PM is already forbidden for the SDX55 fusion once it reaches
++	 * mission mode, but system suspend (s2idle) lands here directly and
++	 * would still attempt the M3 transition. The modem never acknowledges
++	 * it: the host blocks for 2 s, mhi_pm_suspend() fails with -EBUSY, and
++	 * the aborted attempt leaves the link half-transitioned, so the retry
++	 * a moment later reports "Could not enter M0/M1". Observed fallout is
++	 * a fatal exception in the sensor DSP within 40 ms of the retry, an
++	 * slpi crash/recovery loop that pins rproc_crash_handler_work on the
++	 * freezable rproc_recovery_wq (every later suspend then dies in the
++	 * freezer after 20 s), and eventually MDM2AP_ERRFATAL on the modem.
++	 *
++	 * There is nothing to gain by suspending it anyway: this modem is a
++	 * separate chip on its own PMIC, so just leave it in M0/D0 across
++	 * s2idle. Returning before MHI_PCI_DEV_SUSPENDED is set keeps the pair
++	 * symmetric, as mhi_pci_runtime_resume() returns early when it is clear.
++	 */
++	if (mhi_pdev->info == &mhi_qcom_sdx55_fusion_info) {
++		bool sys = test_bit(MHI_PCI_DEV_SYS_SUSPEND, &mhi_pdev->status);
++
++		/*
++		 * Never let the PCI core move this device to D3hot (saving
++		 * the state ourselves is what prevents that): with MSI
++		 * delivery broken on this platform, a modem in D3hot cannot
++		 * signal the host and starves within ~2 minutes. The vendor
++		 * model is M3 with the device kept in D0, the link idling in
++		 * L1.2 on its own, and PCIE_WAKE# as the out-of-band wake.
++		 */
++		pci_save_state(pdev);
++
++		if ((sys ? fusion_m3 : true) &&
++		    test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) &&
++		    mhi_cntrl->ee == MHI_EE_AMSS &&
++		    mhi_sat_settled()) {
++			err = mhi_pm_suspend(mhi_cntrl);
++			if (!err) {
++				set_bit(MHI_PCI_DEV_SUSPENDED, &mhi_pdev->status);
++				set_bit(MHI_PCI_DEV_FUSION_MHI_ONLY,
++					&mhi_pdev->status);
++				dev_dbg(&pdev->dev,
++					"fusion modem entered M3 (D0 kept)\n");
++				return 0;
++			}
++			if (!sys)
++				return -EBUSY;
++			dev_warn(&pdev->dev,
++				 "fusion M3 refused (%d), staying in M0\n", err);
++		} else if (!sys) {
++			/* Not ready for M3 yet; have the PM core retry. */
++			return -EBUSY;
++		}
++		return 0;
++	}
+ 
+ 	if (test_and_set_bit(MHI_PCI_DEV_SUSPENDED, &mhi_pdev->status))
+ 		return 0;
+@@ -1643,6 +3372,8 @@
+ 		return -EBUSY;
+ 	}
+ 
++	dev_info(&pdev->dev, "mhi_pci_runtime_suspend: M3 OK\n");
++
+ pci_suspend:
+ 	pci_disable_device(pdev);
+ 	pci_wake_from_d3(pdev, true);
+@@ -1659,6 +3390,24 @@
+ 
+ 	if (!test_and_clear_bit(MHI_PCI_DEV_SUSPENDED, &mhi_pdev->status))
+ 		return 0;
++
++	if (test_and_clear_bit(MHI_PCI_DEV_FUSION_MHI_ONLY, &mhi_pdev->status)) {
++		/*
++		 * The device stayed in D0 with its state saved, so there is
++		 * nothing PCI-level to undo - only the M3 -> M0 transition.
++		 */
++		err = mhi_pm_resume(mhi_cntrl);
++		if (err) {
++			dev_err(&pdev->dev,
++				"fusion M3 exit failed (%d), scheduling recovery\n",
++				err);
++			queue_work(system_long_wq, &mhi_pdev->recovery_work);
++		} else {
++			dev_dbg(&pdev->dev, "fusion modem back in M0\n");
++		}
++		pm_runtime_mark_last_busy(dev);
++		return 0;
++	}
+ 
+ 	err = pci_enable_device(pdev);
+ 	if (err)
+@@ -1701,8 +3450,15 @@
+ 
+ static int  __maybe_unused mhi_pci_suspend(struct device *dev)
+ {
++	struct mhi_pci_device *mhi_pdev = dev_get_drvdata(dev);
++	int ret;
++
++	set_bit(MHI_PCI_DEV_SYS_SUSPEND, &mhi_pdev->status);
+ 	pm_runtime_disable(dev);
+-	return mhi_pci_runtime_suspend(dev);
++	ret = mhi_pci_runtime_suspend(dev);
++	if (ret)
++		clear_bit(MHI_PCI_DEV_SYS_SUSPEND, &mhi_pdev->status);
++	return ret;
+ }
+ 
+ static int __maybe_unused mhi_pci_resume(struct device *dev)
+@@ -1714,6 +3470,8 @@
+ 	 */
+ 	ret = mhi_pci_runtime_resume(dev);
+ 	pm_runtime_enable(dev);
++	clear_bit(MHI_PCI_DEV_SYS_SUSPEND,
++		  &((struct mhi_pci_device *)dev_get_drvdata(dev))->status);
+ 
+ 	return ret;
+ }
+--- a/drivers/bus/mhi/host/pm.c
++++ b/drivers/bus/mhi/host/pm.c
+@@ -9,9 +9,11 @@
+ #include <linux/dma-direction.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
++#include <linux/iommu.h>
+ #include <linux/list.h>
+ #include <linux/mhi.h>
+ #include <linux/module.h>
++#include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+ #include "internal.h"
+@@ -197,7 +199,11 @@
+ 				 MHISTATUS_READY_MASK, 1, interval_us,
+ 				 timeout_ms);
+ 	if (ret) {
+-		dev_err(dev, "Device failed to enter MHI Ready\n");
++		u32 ctrl_val = 0, status_val = 0;
++		(void)mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, MHICTRL, &ctrl_val);
++		(void)mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, MHISTATUS, &status_val);
++		dev_err(dev, "Device failed to enter MHI Ready: MHICTRL=%#010x MHISTATUS=%#010x\n",
++			ctrl_val, status_val);
+ 		return ret;
+ 	}
+ 
+@@ -249,7 +255,79 @@
+ 
+ 	/* Set MHI to M0 state */
+ 	mhi_set_mhi_state(mhi_cntrl, MHI_STATE_M0);
++
++	/* Debug: poll MHISTATUS to see if device acknowledges M0 */
++	{
++		u32 mhictrl = 0, mhistatus = 0, mhicfg = 0;
++		int poll;
++
++		for (poll = 0; poll < 50; poll++) {
++			(void)mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, 0x48, &mhistatus);
++			if ((mhistatus & 0xff00) == 0x0200) /* M0 in bits[15:8] */
++				break;
++			udelay(100);
++		}
++		(void)mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, 0x10, &mhicfg);
++		(void)mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, 0x38, &mhictrl);
++		dev_info(dev, "After M0 (poll=%d): MHICFG=0x%x MHICTRL=0x%x MHISTATUS=0x%x\n",
++			 poll, mhicfg, mhictrl, mhistatus);
++	}
++
+ 	read_unlock_bh(&mhi_cntrl->pm_lock);
++
++	/*
++	 * Check if the modem wrote events to event ring 0 after M0.
++	 * Wait briefly then compare RP vs WP in the event ring context.
++	 */
++	{
++		struct mhi_event *mhi_event = &mhi_cntrl->mhi_event[0];
++		struct mhi_ring *ring = &mhi_event->ring;
++		struct mhi_event_ctxt *er_ctxt;
++
++		msleep(100);  /* give modem time to write M0 event */
++		er_ctxt = &mhi_cntrl->mhi_ctxt->er_ctxt[0];
++		dev_info(dev, "ER[0] after M0: ctxt_rp=0x%llx ctxt_wp=0x%llx ring_rp=0x%lx ring_wp=0x%lx iommu_base=0x%llx\n",
++			 le64_to_cpu(er_ctxt->rp), le64_to_cpu(er_ctxt->wp),
++			 (unsigned long)(ring->rp - ring->base),
++			 (unsigned long)(ring->wp - ring->base),
++			 ring->iommu_base);
++	}
++
++	/* Diagnostic: check EP MSI config and IOMMU domain after M0 */
++	{
++		struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
++		struct iommu_domain *domain;
++		int msi_cap;
++
++		msi_cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
++		if (msi_cap) {
++			u32 al = 0, ah = 0;
++			u16 mc = 0, md = 0;
++
++			pci_read_config_word(pdev, msi_cap + PCI_MSI_FLAGS, &mc);
++			pci_read_config_dword(pdev, msi_cap + PCI_MSI_ADDRESS_LO,
++					      &al);
++			if (mc & PCI_MSI_FLAGS_64BIT) {
++				pci_read_config_dword(pdev,
++						      msi_cap + PCI_MSI_ADDRESS_HI,
++						      &ah);
++				pci_read_config_word(pdev,
++						     msi_cap + PCI_MSI_DATA_64,
++						     &md);
++			} else {
++				pci_read_config_word(pdev,
++						     msi_cap + PCI_MSI_DATA_32,
++						     &md);
++			}
++			dev_info(dev,
++				 "EP MSI after M0: ctrl=0x%04x addr=0x%08x%08x data=0x%04x\n",
++				 mc, ah, al, md);
++		}
++		domain = iommu_get_domain_for_dev(&pdev->dev);
++		dev_info(dev, "IOMMU domain type=%d for %s\n",
++			 domain ? domain->type : -1,
++			 dev_name(&pdev->dev));
++	}
+ 
+ 	return 0;
+ 
+@@ -879,8 +957,13 @@
+ 
+ 	/* Return busy if there are any pending resources */
+ 	if (atomic_read(&mhi_cntrl->dev_wake) ||
+-	    atomic_read(&mhi_cntrl->pending_pkts))
++	    atomic_read(&mhi_cntrl->pending_pkts)) {
++		dev_info(dev,
++			 "mhi_pm_suspend: EBUSY dev_wake=%d pending_pkts=%d\n",
++			 atomic_read(&mhi_cntrl->dev_wake),
++			 atomic_read(&mhi_cntrl->pending_pkts));
+ 		return -EBUSY;
++	}
+ 
+ 	/* Take MHI out of M2 state */
+ 	read_lock_bh(&mhi_cntrl->pm_lock);
+@@ -1159,8 +1242,8 @@
+ 	}
+ 
+ 	state = mhi_get_mhi_state(mhi_cntrl);
+-	dev_dbg(dev, "Attempting power on with EE: %s, state: %s\n",
+-		TO_MHI_EXEC_STR(current_ee), mhi_state_str(state));
++	dev_info(dev, "Power on: EE=%s state=%s\n",
++		 TO_MHI_EXEC_STR(current_ee), mhi_state_str(state));
+ 
+ 	if (state == MHI_STATE_SYS_ERR) {
+ 		mhi_set_mhi_state(mhi_cntrl, MHI_STATE_RESET);
+--- /dev/null
++++ b/drivers/bus/mhi/host/sahara.c
+@@ -0,0 +1,492 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MHI Sahara firmware loader for Qualcomm modems without onboard flash.
++ *
++ * Implements the Sahara v2 protocol over MHI channels 2/3 (SAHARA) to
++ * load AMSS firmware after SBL EE.  The firmware path is read from
++ * mhi_controller::amss_image, set by the MHI PCI controller driver.
++ */
++
++#include <linux/firmware.h>
++#include <linux/mhi.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/workqueue.h>
++
++/* Sahara v2 protocol commands */
++#define SAHARA_HELLO_CMD		0x01
++#define SAHARA_HELLO_RESP_CMD		0x02
++#define SAHARA_READ_DATA_CMD		0x03
++#define SAHARA_END_OF_IMAGE_CMD		0x04
++#define SAHARA_DONE_CMD			0x05
++#define SAHARA_DONE_RESP_CMD		0x06
++#define SAHARA_RESET_CMD		0x07
++#define SAHARA_CMD_READY_CMD		0x0B
++#define SAHARA_CMD_SWITCH_MODE_CMD	0x0C
++
++#define SAHARA_VERSION			2
++#define SAHARA_SUCCESS			0
++
++#define SAHARA_MODE_IMAGE_TX_PENDING	0x0
++#define SAHARA_MODE_IMAGE_TX_COMPLETE	0x1
++
++/* Packet lengths (bytes, LE) */
++#define SAHARA_HELLO_LENGTH		0x30
++#define SAHARA_READ_DATA_LENGTH		0x14
++#define SAHARA_END_OF_IMAGE_LENGTH	0x10
++#define SAHARA_DONE_LENGTH		0x08
++#define SAHARA_RESET_LENGTH		0x08
++#define SAHARA_CMD_SWITCH_MODE_LENGTH	0x0C
++
++/*
++ * Maximum single MHI TRE payload.  Matches MHI_TRE_DATA_DWORD0() which uses
++ * a 16-bit length field, giving 64 KiB - 1 per TRE.
++ */
++#define SAHARA_MAX_PKT_SZ		0xffffU
++
++/*
++ * Largest READ_DATA request we will accept.  We send the data in
++ * SAHARA_MAX_PKT_SZ chunks linked with MHI_CHAIN.
++ *
++ * SDX55 SBL may request near-whole-image transfers for large firmware blobs
++ * such as qdsp6sw, so keep this comfortably above the largest observed
++ * request size.
++ */
++#define SAHARA_MAX_XFER_SZ		0x6000000U	/* 96 MiB */
++
++struct sahara_packet {
++	__le32 cmd;
++	__le32 length;
++	union {
++		struct {
++			__le32 version;
++			__le32 version_compat;
++			__le32 max_length;
++			__le32 mode;
++		} hello;
++		struct {
++			__le32 version;
++			__le32 version_compat;
++			__le32 status;
++			__le32 mode;
++		} hello_resp;
++		struct {
++			__le32 image;
++			__le32 offset;
++			__le32 length;
++		} read_data;
++		struct {
++			__le32 image;
++			__le32 status;
++		} end_of_image;
++		struct {
++			__le32 mode;
++		} switch_mode;
++	};
++};
++
++struct mhi_sahara_dev {
++	struct mhi_device	*mhi_dev;
++	struct work_struct	work;
++	struct delayed_work	xfer_work;
++	struct sahara_packet	*rx;
++	struct sahara_packet	*ctrl_tx;
++	u8			*data_tx;
++	const struct firmware	*fw;
++	size_t			rx_size;
++	u32			xfer_offset;
++	u32			xfer_remaining;
++	bool			xfer_active;
++};
++
++static void sahara_xfer_retry_work(struct work_struct *work);
++
++static void sahara_schedule_xfer_retry(struct mhi_sahara_dev *sdev)
++{
++	queue_delayed_work(system_wq, &sdev->xfer_work, msecs_to_jiffies(1));
++}
++
++static const char *sahara_image_to_fw(struct mhi_sahara_dev *sdev, u32 image_id)
++{
++	switch (image_id) {
++	case 6:
++		return "sdx55m/apps.mbn";
++	case 23:
++		return "sdx55m/aop.mbn";
++	case 16:
++		return "sdx55m/efs1.bin";
++	case 17:
++		return "sdx55m/efs2.bin";
++	case 20:
++		return "sdx55m/efs3.bin";
++	case 34:
++		return sdev->mhi_dev->mhi_cntrl->amss_image;
++	case 25:
++		return "sdx55m/tz.mbn";
++	case 29:
++		return "sdx55m/acdb.mbn";
++	case 33:
++		return "sdx55m/hyp.mbn";
++	case 40:
++		return "sdx55m/apdp.mbn";
++	case 41:
++		return "sdx55m/devcfg.mbn";
++	case 42:
++		return "sdx55m/sec.elf";
++	default:
++		return "sdx55m/qdsp6sw.mbn";
++	}
++}
++
++static void sahara_send_reset(struct mhi_sahara_dev *sdev)
++{
++	sdev->ctrl_tx->cmd    = cpu_to_le32(SAHARA_RESET_CMD);
++	sdev->ctrl_tx->length = cpu_to_le32(SAHARA_RESET_LENGTH);
++	mhi_queue_buf(sdev->mhi_dev, DMA_TO_DEVICE, sdev->ctrl_tx,
++		      SAHARA_RESET_LENGTH, MHI_EOT);
++}
++
++static void sahara_hello(struct mhi_sahara_dev *sdev)
++{
++	struct device *dev = &sdev->mhi_dev->dev;
++
++	if (le32_to_cpu(sdev->rx->length) != SAHARA_HELLO_LENGTH ||
++	    le32_to_cpu(sdev->rx->hello.version) != SAHARA_VERSION) {
++		dev_err(dev, "Sahara: unexpected HELLO (len=%u ver=%u)\n",
++			le32_to_cpu(sdev->rx->length),
++			le32_to_cpu(sdev->rx->hello.version));
++		return;
++	}
++
++	dev_info(dev, "Sahara: HELLO received, mode=%u\n",
++		 le32_to_cpu(sdev->rx->hello.mode));
++
++	sdev->ctrl_tx->cmd                      = cpu_to_le32(SAHARA_HELLO_RESP_CMD);
++	sdev->ctrl_tx->length                   = cpu_to_le32(SAHARA_HELLO_LENGTH);
++	sdev->ctrl_tx->hello_resp.version       = cpu_to_le32(SAHARA_VERSION);
++	sdev->ctrl_tx->hello_resp.version_compat = cpu_to_le32(SAHARA_VERSION);
++	sdev->ctrl_tx->hello_resp.status        = cpu_to_le32(SAHARA_SUCCESS);
++	sdev->ctrl_tx->hello_resp.mode          = sdev->rx->hello.mode;
++
++	mhi_queue_buf(sdev->mhi_dev, DMA_TO_DEVICE, sdev->ctrl_tx,
++		      SAHARA_HELLO_LENGTH, MHI_EOT);
++}
++
++static int sahara_queue_read_data(struct mhi_sahara_dev *sdev)
++{
++	struct device *dev = &sdev->mhi_dev->dev;
++	u32 chunk;
++	int ret;
++
++	if (!sdev->xfer_active || !sdev->xfer_remaining)
++		return 0;
++
++	chunk = min(sdev->xfer_remaining, (u32)SAHARA_MAX_PKT_SZ);
++	memcpy(sdev->data_tx, sdev->fw->data + sdev->xfer_offset, chunk);
++
++	if (sdev->xfer_offset == le32_to_cpu(sdev->rx->read_data.offset))
++		dev_info(dev, "Sahara: tx[0][0..15] = %*ph\n",
++			 min_t(u32, 16, chunk), sdev->data_tx);
++
++	sdev->xfer_offset += chunk;
++	sdev->xfer_remaining -= chunk;
++
++	ret = mhi_queue_buf(sdev->mhi_dev, DMA_TO_DEVICE, sdev->data_tx,
++			    chunk, MHI_EOT);
++	if (ret) {
++		if (ret != -EAGAIN)
++			dev_err(dev, "Sahara: mhi_queue_buf TX failed: %d\n", ret);
++		else
++			dev_dbg(dev, "Sahara: TX ring full, retrying chunk later\n");
++
++		sdev->xfer_offset -= chunk;
++		sdev->xfer_remaining += chunk;
++		return ret;
++	}
++
++	if (!sdev->xfer_remaining)
++		sdev->xfer_active = false;
++
++	return 0;
++}
++
++static void sahara_read_data(struct mhi_sahara_dev *sdev)
++{
++	struct device *dev = &sdev->mhi_dev->dev;
++	u32 offset, length;
++	int ret;
++
++	if (le32_to_cpu(sdev->rx->length) != SAHARA_READ_DATA_LENGTH) {
++		dev_err(dev, "Sahara: malformed READ_DATA (len=%u)\n",
++			le32_to_cpu(sdev->rx->length));
++		sahara_send_reset(sdev);
++		return;
++	}
++
++	offset = le32_to_cpu(sdev->rx->read_data.offset);
++	length = le32_to_cpu(sdev->rx->read_data.length);
++
++	dev_info(dev, "Sahara: READ_DATA image=%u offset=%u length=%u\n",
++		 le32_to_cpu(sdev->rx->read_data.image), offset, length);
++
++	if (!sdev->fw) {
++		u32 image_id = le32_to_cpu(sdev->rx->read_data.image);
++		const char *fw_name = sahara_image_to_fw(sdev, image_id);
++
++		if (!fw_name) {
++			dev_err(dev, "Sahara: no firmware configured for image %u\n",
++				image_id);
++			sahara_send_reset(sdev);
++			return;
++		}
++
++		ret = request_firmware(&sdev->fw, fw_name, dev);
++		if (ret) {
++			dev_err(dev, "Sahara: failed to load %s: %d\n",
++				fw_name, ret);
++			sahara_send_reset(sdev);
++			return;
++		}
++
++		dev_info(dev, "Sahara: image %u -> loaded %s (%zu bytes)\n",
++			 image_id, fw_name, sdev->fw->size);
++	}
++
++	if (length > SAHARA_MAX_XFER_SZ) {
++		dev_err(dev, "Sahara: READ_DATA length %u exceeds max %u\n",
++			length, SAHARA_MAX_XFER_SZ);
++		sahara_send_reset(sdev);
++		return;
++	}
++
++	if (offset >= sdev->fw->size ||
++	    (u64)offset + length > sdev->fw->size) {
++		dev_err(dev, "Sahara: READ_DATA out of range (off=%u len=%u fwsz=%zu)\n",
++			offset, length, sdev->fw->size);
++		sahara_send_reset(sdev);
++		return;
++	}
++
++	dev_info(dev, "Sahara: fw[0x%x..+%u] = %*ph\n",
++		 offset, length, min_t(u32, 16, length), sdev->fw->data + offset);
++
++	sdev->xfer_offset = offset;
++	sdev->xfer_remaining = length;
++	sdev->xfer_active = true;
++
++	ret = sahara_queue_read_data(sdev);
++	if (ret == -EAGAIN)
++		sahara_schedule_xfer_retry(sdev);
++	else if (ret)
++		sahara_send_reset(sdev);
++}
++
++static void sahara_end_of_image(struct mhi_sahara_dev *sdev)
++{
++	struct device *dev = &sdev->mhi_dev->dev;
++
++	if (le32_to_cpu(sdev->rx->end_of_image.status)) {
++		dev_err(dev, "Sahara: END_OF_IMAGE status %u\n",
++			le32_to_cpu(sdev->rx->end_of_image.status));
++		return;
++	}
++
++	dev_info(dev, "Sahara: END_OF_IMAGE OK (image=%u), sending DONE\n",
++		 le32_to_cpu(sdev->rx->end_of_image.image));
++
++	sdev->ctrl_tx->cmd    = cpu_to_le32(SAHARA_DONE_CMD);
++	sdev->ctrl_tx->length = cpu_to_le32(SAHARA_DONE_LENGTH);
++	mhi_queue_buf(sdev->mhi_dev, DMA_TO_DEVICE, sdev->ctrl_tx,
++		      SAHARA_DONE_LENGTH, MHI_EOT);
++}
++
++static void sahara_work(struct work_struct *work)
++{
++	struct mhi_sahara_dev *sdev =
++		container_of(work, struct mhi_sahara_dev, work);
++	int ret;
++
++	switch (le32_to_cpu(sdev->rx->cmd)) {
++	case SAHARA_HELLO_CMD:
++		sahara_hello(sdev);
++		break;
++	case SAHARA_READ_DATA_CMD:
++		sahara_read_data(sdev);
++		break;
++	case SAHARA_END_OF_IMAGE_CMD:
++		sahara_end_of_image(sdev);
++		break;
++	case SAHARA_DONE_RESP_CMD:
++		dev_info(&sdev->mhi_dev->dev,
++			 "Sahara: DONE_RESP received, session complete\n");
++		/*
++		 * Release current firmware so the next READ_DATA re-evaluates
++		 * which file to load (the modem may start a second SAHARA
++		 * session requesting different image IDs).
++		 */
++		if (sdev->fw) {
++			release_firmware(sdev->fw);
++			sdev->fw = NULL;
++		}
++		sdev->xfer_active = false;
++		sdev->xfer_offset = 0;
++		sdev->xfer_remaining = 0;
++		cancel_delayed_work(&sdev->xfer_work);
++		break;	/* re-queue RX to listen for a possible next HELLO */
++	case SAHARA_CMD_READY_CMD:
++		/*
++		 * Modem is in command mode and ready for host commands.
++		 * We don't need to execute any commands — just ask the
++		 * modem to switch to image transfer mode.  It will reply
++		 * with a fresh HELLO (mode=0).
++		 */
++		dev_info(&sdev->mhi_dev->dev,
++			 "Sahara: CMD_READY, sending CMD_SWITCH_MODE -> image TX\n");
++		sdev->ctrl_tx->cmd    = cpu_to_le32(SAHARA_CMD_SWITCH_MODE_CMD);
++		sdev->ctrl_tx->length = cpu_to_le32(SAHARA_CMD_SWITCH_MODE_LENGTH);
++		sdev->ctrl_tx->switch_mode.mode = cpu_to_le32(SAHARA_MODE_IMAGE_TX_PENDING);
++		mhi_queue_buf(sdev->mhi_dev, DMA_TO_DEVICE, sdev->ctrl_tx,
++			      SAHARA_CMD_SWITCH_MODE_LENGTH, MHI_EOT);
++		break;
++	case SAHARA_RESET_CMD:
++		/* Device-initiated reset — just re-queue and wait */
++		break;
++	default:
++		dev_err(&sdev->mhi_dev->dev,
++			"Sahara: unknown command 0x%x\n",
++			le32_to_cpu(sdev->rx->cmd));
++		break;
++	}
++
++	/* Refill the single RX slot */
++	ret = mhi_queue_buf(sdev->mhi_dev, DMA_FROM_DEVICE, sdev->rx,
++			    SAHARA_MAX_PKT_SZ, MHI_EOT);
++	if (ret)
++		dev_err(&sdev->mhi_dev->dev,
++			"Sahara: failed to requeue RX buf: %d\n", ret);
++}
++
++static int sahara_mhi_probe(struct mhi_device *mhi_dev,
++			    const struct mhi_device_id *id)
++{
++	struct mhi_sahara_dev *sdev;
++	int ret;
++
++	sdev = devm_kzalloc(&mhi_dev->dev, sizeof(*sdev), GFP_KERNEL);
++	if (!sdev)
++		return -ENOMEM;
++
++	sdev->rx = devm_kzalloc(&mhi_dev->dev, SAHARA_MAX_PKT_SZ, GFP_KERNEL);
++	if (!sdev->rx)
++		return -ENOMEM;
++
++	sdev->ctrl_tx = devm_kzalloc(&mhi_dev->dev, SAHARA_MAX_PKT_SZ, GFP_KERNEL);
++	if (!sdev->ctrl_tx)
++		return -ENOMEM;
++
++	sdev->data_tx = devm_kzalloc(&mhi_dev->dev, SAHARA_MAX_PKT_SZ, GFP_KERNEL);
++	if (!sdev->data_tx)
++		return -ENOMEM;
++
++	sdev->mhi_dev = mhi_dev;
++	INIT_WORK(&sdev->work, sahara_work);
++	INIT_DELAYED_WORK(&sdev->xfer_work, sahara_xfer_retry_work);
++	dev_set_drvdata(&mhi_dev->dev, sdev);
++
++	ret = mhi_prepare_for_transfer(mhi_dev);
++	if (ret)
++		return ret;
++
++	ret = mhi_queue_buf(mhi_dev, DMA_FROM_DEVICE, sdev->rx,
++			    SAHARA_MAX_PKT_SZ, MHI_EOT);
++	if (ret) {
++		mhi_unprepare_from_transfer(mhi_dev);
++		return ret;
++	}
++
++	dev_info(&mhi_dev->dev, "Sahara: MHI channels ready, waiting for modem\n");
++	return 0;
++}
++
++static void sahara_mhi_remove(struct mhi_device *mhi_dev)
++{
++	struct mhi_sahara_dev *sdev = dev_get_drvdata(&mhi_dev->dev);
++
++	cancel_work_sync(&sdev->work);
++	cancel_delayed_work_sync(&sdev->xfer_work);
++	if (sdev->fw)
++		release_firmware(sdev->fw);
++	mhi_unprepare_from_transfer(mhi_dev);
++}
++
++static void sahara_mhi_ul_xfer_cb(struct mhi_device *mhi_dev,
++				  struct mhi_result *result)
++{
++	struct mhi_sahara_dev *sdev = dev_get_drvdata(&mhi_dev->dev);
++	int ret;
++
++	if (result->transaction_status) {
++		dev_err(&mhi_dev->dev, "Sahara: TX completion failed: %d\n",
++			result->transaction_status);
++		sdev->xfer_active = false;
++		return;
++	}
++
++	if (result->buf_addr != sdev->data_tx || !sdev->xfer_remaining)
++		return;
++
++	ret = sahara_queue_read_data(sdev);
++	if (ret == -EAGAIN)
++		sahara_schedule_xfer_retry(sdev);
++	else if (ret)
++		sahara_send_reset(sdev);
++}
++
++static void sahara_xfer_retry_work(struct work_struct *work)
++{
++	struct mhi_sahara_dev *sdev =
++		container_of(to_delayed_work(work), struct mhi_sahara_dev, xfer_work);
++	int ret;
++
++	if (!sdev->xfer_active || !sdev->xfer_remaining)
++		return;
++
++	ret = sahara_queue_read_data(sdev);
++	if (ret == -EAGAIN)
++		sahara_schedule_xfer_retry(sdev);
++	else if (ret)
++		sahara_send_reset(sdev);
++}
++
++static void sahara_mhi_dl_xfer_cb(struct mhi_device *mhi_dev,
++				  struct mhi_result *result)
++{
++	struct mhi_sahara_dev *sdev = dev_get_drvdata(&mhi_dev->dev);
++
++	if (result->transaction_status)
++		return;
++
++	sdev->rx_size = result->bytes_xferd;
++	schedule_work(&sdev->work);
++}
++
++static const struct mhi_device_id sahara_mhi_match_table[] = {
++	{ .chan = "SAHARA" },
++	{}
++};
++MODULE_DEVICE_TABLE(mhi, sahara_mhi_match_table);
++
++static struct mhi_driver sahara_mhi_driver = {
++	.id_table    = sahara_mhi_match_table,
++	.probe       = sahara_mhi_probe,
++	.remove      = sahara_mhi_remove,
++	.ul_xfer_cb  = sahara_mhi_ul_xfer_cb,
++	.dl_xfer_cb  = sahara_mhi_dl_xfer_cb,
++	.driver      = {
++		.name = "mhi_sahara_modem",
++	},
++};
++module_mhi_driver(sahara_mhi_driver);
++
++MODULE_DESCRIPTION("MHI Sahara firmware loader for Qualcomm modems");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/bus/mhi/host/satellite.c
+@@ -0,0 +1,1722 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MHI satellite driver: lets a remote subsystem drive its own MHI channels.
++ *
++ * Ported from the Qualcomm downstream mhi_satellite driver
++ * (Copyright (c) 2019, The Linux Foundation).
++ *
++ * On boards where the modem hangs off PCIe, the audio DSP needs to talk to it
++ * directly -- call audio is negotiated between the two with the AP nowhere in
++ * the data path. The DSP has no PCIe access of its own, so instead the AP hosts
++ * the MHI controller and *lends* a few channels to the DSP: the DSP builds the
++ * channel and event ring contexts in its own memory, sends them here over a
++ * glink/rpmsg link, and this driver installs them into the MHI core and starts
++ * the channels. From then on the DSP rings doorbells and consumes events
++ * itself.
++ *
++ * So this is a proxy for MHI control operations, not a data path. The messages
++ * are MHI transfer-ring elements wrapped in a small header; we execute the ones
++ * the remote cannot (IOMMU mapping, context install, channel start/stop) and
++ * reply with completion events.
++ *
++ * The remote also has to be told when the device dies, hence the sys_err
++ * plumbing: without it the DSP would keep using rings that no longer exist.
++ */
++
++#include <linux/async.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/list.h>
++#include <linux/mhi.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/pm_runtime.h>
++#include <linux/pci.h>
++#include <linux/rpmsg.h>
++#include <linux/sched/clock.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++
++#include "internal.h"
++
++#define MHI_SAT_DRIVER_NAME "mhi_satellite"
++
++/* sys_err command */
++#define MHI_TRE_CMD_SYS_ERR_PTR		0
++#define MHI_TRE_CMD_SYS_ERR_D0		0
++#define MHI_TRE_CMD_SYS_ERR_D1		(MHI_PKT_TYPE_SYS_ERR_CMD << 16)
++
++/* state change event */
++#define MHI_TRE_EVT_MHI_STATE_PTR	0
++#define MHI_TRE_EVT_MHI_STATE_D0(state)	((state) << 24)
++#define MHI_TRE_EVT_MHI_STATE_D1	(MHI_PKT_TYPE_STATE_CHANGE_EVENT << 16)
++
++/* exec env change event */
++#define MHI_TRE_EVT_EE_PTR		0
++#define MHI_TRE_EVT_EE_D0(ee)		((ee) << 24)
++#define MHI_TRE_EVT_EE_D1		(MHI_PKT_TYPE_EE_EVENT << 16)
++
++/* config (hello) event */
++#define MHI_TRE_EVT_CFG_PTR(base)	(base)
++#define MHI_TRE_EVT_CFG_D0(er_base, n)	(((er_base) << 16) | ((n) & 0xFFFF))
++#define MHI_TRE_EVT_CFG_D1		(MHI_PKT_TYPE_CFG_EVENT << 16)
++
++/* command completion event */
++#define MHI_TRE_EVT_CMD_COMPLETION_PTR(ptr)	(ptr)
++#define MHI_TRE_EVT_CMD_COMPLETION_D0(code)	((code) << 24)
++#define MHI_TRE_EVT_CMD_COMPLETION_D1	(MHI_PKT_TYPE_CMD_COMPLETION_EVENT << 16)
++
++/* packet parsers */
++#define MHI_TRE_GET_PTR(tre)		((tre)->ptr)
++#define MHI_TRE_GET_SIZE(tre)		((tre)->dword[0])
++#define MHI_TRE_GET_CCS(tre)		(((tre)->dword[0] >> 24) & 0xFF)
++#define MHI_TRE_GET_ID(tre)		(((tre)->dword[1] >> 24) & 0xFF)
++#define MHI_TRE_GET_TYPE(tre)		(((tre)->dword[1] >> 16) & 0xFF)
++#define MHI_TRE_IS_ER_CTXT_TYPE(tre)	((tre)->dword[1] & 0x1)
++
++#define MHI_CTXT_TYPE_GENERIC		0xA
++
++struct __packed mhi_generic_ctxt {
++	u32 reserved0;
++	u32 type;
++	u32 reserved1;
++	u64 ctxt_base;
++	u64 ctxt_size;
++	u64 reserved[2];
++};
++
++/*
++ * Packet types that only exist on the satellite link. The rest of the
++ * MHI_PKT_TYPE_* and all of enum mhi_ev_ccs come from common.h, which
++ * internal.h already pulls in.
++ */
++#define MHI_PKT_TYPE_CTXT_UPDATE_CMD	0x64
++#define MHI_PKT_TYPE_IOMMU_MAP_CMD	0x65
++#define MHI_PKT_TYPE_CFG_EVENT		0x6E
++#define MHI_PKT_TYPE_SYS_ERR_CMD	0xFF
++
++enum subsys_id {
++	SUBSYS_ADSP,
++	SUBSYS_SLPI,
++	SUBSYS_MAX,
++};
++
++static const char * const subsys_names[SUBSYS_MAX] = {
++	[SUBSYS_ADSP] = "lpass",
++	[SUBSYS_SLPI] = "slpi",
++};
++
++/* IPC definitions */
++#define SAT_MAJOR_VERSION	1
++#define SAT_MINOR_VERSION	0
++#define SAT_RESERVED_SEQ_NUM	0xFFFF
++#define SAT_MSG_SIZE(n)		(sizeof(struct sat_header) + \
++				 ((n) * sizeof(struct sat_tre)))
++#define SAT_TRE_SIZE(msg_size)	((msg_size) - sizeof(struct sat_header))
++#define SAT_TRE_OFFSET(msg)	((msg) + sizeof(struct sat_header))
++#define SAT_TRE_NUM_PKTS(size)	((size) / sizeof(struct sat_tre))
++
++enum sat_msg_id {
++	SAT_MSG_ID_ACK = 0xA,
++	SAT_MSG_ID_CMD = 0xC,
++	SAT_MSG_ID_EVT = 0xE,
++};
++
++enum sat_ctxt_type {
++	SAT_CTXT_TYPE_CHAN	= 0x0,
++	SAT_CTXT_TYPE_EVENT	= 0x1,
++	SAT_CTXT_TYPE_MAX,
++};
++
++static const char * const sat_ctxt_str[SAT_CTXT_TYPE_MAX] = {
++	[SAT_CTXT_TYPE_CHAN] = "CCA",
++	[SAT_CTXT_TYPE_EVENT] = "ECA",
++};
++
++#define TO_SAT_CTXT_TYPE_STR(t) \
++	((t) >= SAT_CTXT_TYPE_MAX ? "INVALID" : sat_ctxt_str[t])
++
++struct __packed sat_tre {
++	u64 ptr;
++	u32 dword[2];
++};
++
++struct __packed sat_header {
++	u16 major_ver;
++	u16 minor_ver;
++	u16 msg_id;
++	u16 seq;
++	u16 reply_seq;
++	u16 payload_size;
++	u32 dev_id;
++	u8 reserved[8];
++};
++
++/*
++ * Addresses the remote asked us to map on its behalf. Kept so they can be
++ * released when the link or the device goes away; mhi_buf has no list node.
++ */
++struct mhi_sat_addr_map {
++	struct list_head node;
++	phys_addr_t phys_addr;
++	dma_addr_t dma_addr;
++	size_t len;
++};
++
++struct mhi_sat_packet {
++	struct list_head node;
++	struct mhi_sat_cntrl *cntrl;
++	void *msg;
++};
++
++/*
++ * Consulted by the fusion suspend path: entering M3 while a satellite
++ * link is (re)initializing crashes the modem, so M3 is only attempted
++ * once every satellite state has been stable for a while.
++ */
++static bool sat_allow_diag = true;
++module_param(sat_allow_diag, bool, 0644);
++MODULE_PARM_DESC(sat_allow_diag, "Allow the remote's diag-forwarding satellite channels (refusing them makes the ADSP abandon the whole channel setup, killing call audio)");
++
++unsigned long mhi_sat_last_transition_jiffies;
++
++static void mhi_sat_mark_transition(void)
++{
++	WRITE_ONCE(mhi_sat_last_transition_jiffies, jiffies);
++}
++
++enum mhi_sat_state {
++	SAT_READY,		/* device presented, no link yet */
++	SAT_RUNNING,		/* remote can talk to the device */
++	SAT_DISCONNECTED,	/* rpmsg link down */
++	SAT_FATAL_DETECT,	/* device asserted */
++	SAT_ERROR,		/* device down after error or shutdown */
++	SAT_DISABLED,		/* wait for device removal */
++	SAT_STATE_MAX,
++};
++
++static const char * const sat_state_str[SAT_STATE_MAX] = {
++	[SAT_READY]		= "ready",
++	[SAT_RUNNING]		= "running",
++	[SAT_DISCONNECTED]	= "disconnected",
++	[SAT_FATAL_DETECT]	= "fatal detected",
++	[SAT_ERROR]		= "error",
++	[SAT_DISABLED]		= "disabled",
++};
++
++#define MHI_SAT_ACTIVE(c)	((c)->state == SAT_RUNNING)
++#define MHI_SAT_IN_ERROR(c)	((c)->state >= SAT_FATAL_DETECT)
++#define MHI_SAT_ALLOW_CONN(c)	((c)->state == SAT_READY || \
++				 (c)->state == SAT_DISCONNECTED)
++#define MHI_SAT_ALLOW_SYS_ERR(c) ((c)->state == SAT_RUNNING || \
++				  (c)->state == SAT_FATAL_DETECT)
++
++/*
++ * Everything the remote asked for this boot, and what it was told in reply.
++ *
++ * The exchange happens once, early, and is over before anyone can arm dynamic
++ * debug -- and a request the host refuses is answered with an error code the
++ * remote accepts without complaint, so a rejected channel and a granted one
++ * look the same from the outside. Recording it is the only way to tell.
++ *
++ * Deep enough that the boot exchange is still there after a call has run: the
++ * two are read together, since what matters is whether the remote asked for
++ * anything new while the call was being set up, and boot is the baseline it is
++ * compared against.
++ */
++#define MHI_SAT_LOG_ENTRIES	256
++
++struct mhi_sat_log_entry {
++	u64 ts;
++	u64 ptr;
++	u32 size;
++	u8 type;
++	u8 ccs;
++	u8 id;
++	bool er;	/* the id names an event ring, not a channel */
++};
++
++struct mhi_sat_subsys {
++	const char *name;
++	struct rpmsg_device *rpdev;
++
++	struct list_head cntrl_list;
++	struct mutex cntrl_mutex;
++	spinlock_t cntrl_lock;
++};
++
++struct mhi_sat_cntrl {
++	struct list_head node;
++
++	struct mhi_controller *mhi_cntrl;
++	struct mhi_sat_subsys *subsys;
++
++	struct list_head dev_list;
++	struct list_head addr_map_list;
++	struct mutex list_mutex;
++
++	struct list_head packet_list;
++	spinlock_t pkt_lock;
++
++	struct work_struct connect_work;
++	struct work_struct process_work;
++	async_cookie_t error_cookie;
++
++	u32 dev_id;
++	phys_addr_t base_addr;	/* physical MHI register base, for the remote */
++	int er_base;
++	int er_max;
++	int num_er;
++
++	int num_devices;
++	int max_devices;
++	u16 seq;
++	enum mhi_sat_state state;
++	spinlock_t state_lock;
++
++	u16 last_cmd_seq;
++	enum mhi_ev_ccs last_cmd_ccs;
++	struct completion completion;
++	struct mutex cmd_wait_mutex;
++
++	/* diagnostics; see mhi_sat_status_show() and mhi_sat_log_show() */
++	struct dentry *dbgfs;
++	unsigned int hellos;
++	unsigned int rx_cmds;
++	unsigned int rx_evts;
++
++	struct mhi_sat_log_entry log[MHI_SAT_LOG_ENTRIES];
++	unsigned int log_next;
++	spinlock_t log_lock;
++};
++
++struct mhi_sat_device {
++	struct list_head node;
++	struct mhi_device *mhi_dev;
++	struct mhi_sat_cntrl *cntrl;
++	bool chan_started;
++};
++
++static struct mhi_sat_subsys *mhi_sat_subsys_array;
++
++/*
++ * How many satellite channels the remote expects to share. The downstream
++ * driver reads this from each MHI device's DT node; mainline MHI devices have
++ * none, so it is fixed here. It must match the number of channels declared for
++ * the subsystem in the controller config, otherwise the link never comes up.
++ */
++#define MHI_SAT_MAX_DEVICES 4
++
++static struct mhi_sat_subsys *find_subsys_by_name(const char *name)
++{
++	struct mhi_sat_subsys *subsys = mhi_sat_subsys_array;
++	int i;
++
++	for (i = 0; i < SUBSYS_MAX; i++, subsys++) {
++		if (!strcmp(name, subsys->name))
++			return subsys;
++	}
++
++	return NULL;
++}
++
++/*
++ * The remote rings the device's doorbells directly over the BAR, invisibly
++ * to the host's runtime PM - audio lands on a runtime-suspended modem and
++ * is silently lost. Pin the device in M0 for as long as a satellite
++ * channel is started (in practice: for the duration of a voice call).
++ */
++/*
++ * The always-started diag channels must not pin the device - the ADSP's
++ * own MHI stack asserts the wake doorbell for its bursts and the modem
++ * pulls WAKE# to be resumed. Voice channels span exactly a call, and
++ * for those the pin buys glitch-free audio.
++ */
++static bool mhi_sat_chan_is_diag(struct mhi_sat_device *sat_dev)
++{
++	int ul = sat_dev->mhi_dev->ul_chan_id;
++	int dl = sat_dev->mhi_dev->dl_chan_id;
++
++	return ul == 50 || ul == 51 || dl == 50 || dl == 51;
++}
++
++static void mhi_sat_chan_started(struct mhi_sat_device *sat_dev)
++{
++	sat_dev->chan_started = true;
++	/*
++	 * Synchronous: the remote starts ringing doorbells the moment the
++	 * start is granted, and an async resume left a window where those
++	 * doorbells landed on a runtime-suspended device - observed as the
++	 * modem's QMI stalling out the instant a call began.
++	 */
++	if (!mhi_sat_chan_is_diag(sat_dev))
++		pm_runtime_get_sync(sat_dev->cntrl->mhi_cntrl->cntrl_dev);
++}
++
++static void mhi_sat_chan_stopped(struct mhi_sat_device *sat_dev)
++{
++	sat_dev->chan_started = false;
++	if (!mhi_sat_chan_is_diag(sat_dev)) {
++		pm_runtime_mark_last_busy(sat_dev->cntrl->mhi_cntrl->cntrl_dev);
++		pm_runtime_put(sat_dev->cntrl->mhi_cntrl->cntrl_dev);
++	}
++}
++
++static struct mhi_sat_cntrl *find_sat_cntrl_by_id(struct mhi_sat_subsys *subsys,
++						  u32 dev_id)
++{
++	struct mhi_sat_cntrl *sat_cntrl;
++	unsigned long flags;
++
++	spin_lock_irqsave(&subsys->cntrl_lock, flags);
++	list_for_each_entry(sat_cntrl, &subsys->cntrl_list, node) {
++		if (sat_cntrl->dev_id == dev_id) {
++			spin_unlock_irqrestore(&subsys->cntrl_lock, flags);
++			return sat_cntrl;
++		}
++	}
++	spin_unlock_irqrestore(&subsys->cntrl_lock, flags);
++
++	return NULL;
++}
++
++/* event ring index of a device's channel; not exposed outside the MHI core */
++static int mhi_sat_dev_er_index(struct mhi_device *mhi_dev)
++{
++	struct mhi_chan *mhi_chan = mhi_dev->dl_chan ?: mhi_dev->ul_chan;
++
++	return mhi_chan ? mhi_chan->er_index : 0;
++}
++
++static struct mhi_sat_device *find_sat_dev_by_id(struct mhi_sat_cntrl *sat_cntrl,
++						 int id, enum sat_ctxt_type evt)
++{
++	struct mhi_sat_device *sat_dev;
++	int compare_id;
++
++	mutex_lock(&sat_cntrl->list_mutex);
++	list_for_each_entry(sat_dev, &sat_cntrl->dev_list, node) {
++		compare_id = (evt == SAT_CTXT_TYPE_EVENT) ?
++				mhi_sat_dev_er_index(sat_dev->mhi_dev) :
++				sat_dev->mhi_dev->dl_chan_id;
++
++		if (compare_id == id) {
++			mutex_unlock(&sat_cntrl->list_mutex);
++			return sat_dev;
++		}
++	}
++	mutex_unlock(&sat_cntrl->list_mutex);
++
++	return NULL;
++}
++
++static bool mhi_sat_isvalid_header(struct sat_header *hdr, int len)
++{
++	if (len < (int)sizeof(*hdr))
++		return false;
++
++	if (len != (int)(hdr->payload_size + sizeof(*hdr)))
++		return false;
++
++	if (hdr->major_ver != SAT_MAJOR_VERSION ||
++	    hdr->minor_ver != SAT_MINOR_VERSION)
++		return false;
++
++	if (hdr->msg_id != SAT_MSG_ID_CMD && hdr->msg_id != SAT_MSG_ID_EVT)
++		return false;
++
++	return true;
++}
++
++static int mhi_sat_wait_cmd_completion(struct mhi_sat_cntrl *sat_cntrl)
++{
++	struct device *dev = sat_cntrl->mhi_cntrl->cntrl_dev;
++	int ret;
++
++	ret = wait_for_completion_timeout(&sat_cntrl->completion,
++			msecs_to_jiffies(sat_cntrl->mhi_cntrl->timeout_ms));
++	if (!ret || sat_cntrl->last_cmd_ccs != MHI_EV_CC_SUCCESS) {
++		dev_err(dev, "sat: command failed seq:%u ret:%d ccs:%d\n",
++			sat_cntrl->last_cmd_seq, ret, sat_cntrl->last_cmd_ccs);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int mhi_sat_send_msg(struct mhi_sat_cntrl *sat_cntrl,
++			    enum sat_msg_id type, u16 reply_seq,
++			    void *msg, u16 msg_size)
++{
++	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
++	struct sat_header *hdr = msg;
++
++	if (!subsys->rpdev)
++		return -ENODEV;
++
++	sat_cntrl->seq++;
++	if (sat_cntrl->seq == SAT_RESERVED_SEQ_NUM)
++		sat_cntrl->seq = 0;
++
++	hdr->major_ver = SAT_MAJOR_VERSION;
++	hdr->minor_ver = SAT_MINOR_VERSION;
++	hdr->msg_id = type;
++	hdr->seq = sat_cntrl->seq;
++	hdr->reply_seq = reply_seq;
++	hdr->payload_size = SAT_TRE_SIZE(msg_size);
++	hdr->dev_id = sat_cntrl->dev_id;
++
++	if (type == SAT_MSG_ID_CMD)
++		sat_cntrl->last_cmd_seq = sat_cntrl->seq;
++
++	return rpmsg_send(subsys->rpdev->ept, msg, msg_size);
++}
++
++static void mhi_sat_log(struct mhi_sat_cntrl *sat_cntrl, u8 type, u8 id,
++			bool er, u64 ptr, u32 size, u8 ccs)
++{
++	struct mhi_sat_log_entry *e;
++	unsigned long flags;
++
++	spin_lock_irqsave(&sat_cntrl->log_lock, flags);
++
++	e = &sat_cntrl->log[sat_cntrl->log_next % MHI_SAT_LOG_ENTRIES];
++	sat_cntrl->log_next++;
++
++	e->ts = local_clock();
++	e->ptr = ptr;
++	e->size = size;
++	e->type = type;
++	e->ccs = ccs;
++	e->id = id;
++	e->er = er;
++
++	spin_unlock_irqrestore(&sat_cntrl->log_lock, flags);
++}
++
++/*
++ * Execute the commands the remote cannot issue itself and rewrite each packet
++ * in place into its completion event -- the caller ships the same buffer back.
++ */
++static void mhi_sat_process_cmds(struct mhi_sat_cntrl *sat_cntrl,
++				 struct sat_header *hdr, struct sat_tre *pkt)
++{
++	struct mhi_controller *mhi_cntrl = sat_cntrl->mhi_cntrl;
++	struct device *dev = mhi_cntrl->cntrl_dev;
++	int num_pkts = SAT_TRE_NUM_PKTS(hdr->payload_size);
++	int i;
++
++	for (i = 0; i < num_pkts; i++, pkt++) {
++		enum mhi_ev_ccs code = MHI_EV_CC_INVALID;
++		u64 completion_ptr = 0;
++
++		/* the packet is rewritten below, so keep what it asked for */
++		u8 log_type = MHI_TRE_GET_TYPE(pkt);
++		u8 log_id = MHI_TRE_GET_ID(pkt);
++		bool log_er = MHI_TRE_IS_ER_CTXT_TYPE(pkt);
++		u64 log_ptr = MHI_TRE_GET_PTR(pkt);
++		u32 log_size = MHI_TRE_GET_SIZE(pkt);
++
++		switch (MHI_TRE_GET_TYPE(pkt)) {
++		case MHI_PKT_TYPE_IOMMU_MAP_CMD: {
++			struct mhi_sat_addr_map *map;
++			dma_addr_t iova;
++
++			map = kzalloc(sizeof(*map), GFP_KERNEL);
++			if (!map)
++				break;
++
++			map->phys_addr = MHI_TRE_GET_PTR(pkt);
++			map->len = MHI_TRE_GET_SIZE(pkt);
++
++			iova = dma_map_resource(dev, map->phys_addr, map->len,
++						DMA_BIDIRECTIONAL, 0);
++			if (dma_mapping_error(dev, iova)) {
++				kfree(map);
++				break;
++			}
++
++			map->dma_addr = iova;
++			completion_ptr = iova;
++
++			mutex_lock(&sat_cntrl->list_mutex);
++			list_add_tail(&map->node, &sat_cntrl->addr_map_list);
++			mutex_unlock(&sat_cntrl->list_mutex);
++
++			code = MHI_EV_CC_SUCCESS;
++			dev_dbg(dev, "sat: IOMMU MAP %pap len:%zu -> %pad\n",
++				&map->phys_addr, map->len, &iova);
++			break;
++		}
++		case MHI_PKT_TYPE_CTXT_UPDATE_CMD: {
++			enum sat_ctxt_type evt = MHI_TRE_IS_ER_CTXT_TYPE(pkt);
++			int id = MHI_TRE_GET_ID(pkt);
++			struct mhi_generic_ctxt gen_ctxt = {0};
++			struct mhi_sat_device *sat_dev;
++			struct mhi_buf buf = {0};
++
++			sat_dev = find_sat_dev_by_id(sat_cntrl, id, evt);
++			if (!sat_dev) {
++				dev_err(dev, "sat: no device for chan/evt %d\n", id);
++				break;
++			}
++
++			/*
++			 * A context update for a channel we still believe is
++			 * running means the remote has started over without
++			 * telling us: it re-maps its buffers and pushes fresh
++			 * ring addresses, but never sends RESET_CHAN first, so
++			 * nothing here clears chan_started. Left alone, the
++			 * START that follows is refused, and the channel we
++			 * kept instead points at rings the remote has already
++			 * abandoned -- the link stays down until the next
++			 * reboot. Tear it down so the start can succeed.
++			 */
++			if (evt == SAT_CTXT_TYPE_CHAN && sat_dev->chan_started) {
++				dev_info(dev, "sat: chan %d restarted by %s\n",
++					 id, sat_cntrl->subsys->name);
++				mhi_unprepare_from_transfer(sat_dev->mhi_dev);
++				mhi_sat_chan_stopped(sat_dev);
++			}
++
++			gen_ctxt.type = MHI_CTXT_TYPE_GENERIC;
++			gen_ctxt.ctxt_base = MHI_TRE_GET_PTR(pkt);
++			gen_ctxt.ctxt_size = MHI_TRE_GET_SIZE(pkt);
++
++			buf.buf = &gen_ctxt;
++			buf.len = sizeof(gen_ctxt);
++			buf.name = TO_SAT_CTXT_TYPE_STR(evt);
++
++			if (!mhi_device_configure(sat_dev->mhi_dev,
++						  DMA_BIDIRECTIONAL, &buf, 1))
++				code = MHI_EV_CC_SUCCESS;
++
++			dev_dbg(dev, "sat: CTXT UPDATE %s:%d %s\n", buf.name, id,
++				code == MHI_EV_CC_SUCCESS ? "ok" : "failed");
++			break;
++		}
++		case MHI_PKT_TYPE_START_CHAN_CMD: {
++			int id = MHI_TRE_GET_ID(pkt);
++			struct mhi_sat_device *sat_dev;
++
++			/*
++			 * The ADSP's diag-forwarding channels stream its
++			 * diagnostics into the modem continuously; servicing
++			 * them keeps the ADSP from ever power-collapsing and
++			 * gives the modem link no idle window for M1/M2.
++			 * Nothing on this system consumes that stream (ADSP
++			 * F3 is read over QRTR), so refuse the start - the
++			 * remote treats a refusal as the feature being
++			 * unavailable. sat_allow_diag=1 restores it.
++			 */
++			if (!sat_allow_diag && (id == 50 || id == 51)) {
++				dev_info(dev,
++					 "sat: refusing diag chan %d for power\n",
++					 id);
++				break;
++			}
++
++			sat_dev = find_sat_dev_by_id(sat_cntrl, id,
++						     SAT_CTXT_TYPE_CHAN);
++			if (!sat_dev || sat_dev->chan_started) {
++				dev_err(dev, "sat: bad START for chan %d\n", id);
++				break;
++			}
++
++			mhi_sat_chan_started(sat_dev);
++			if (!mhi_prepare_for_transfer(sat_dev->mhi_dev))
++				code = MHI_EV_CC_SUCCESS;
++			else
++				mhi_sat_chan_stopped(sat_dev);
++
++			dev_dbg(dev, "sat: START chan %d %s\n", id,
++				code == MHI_EV_CC_SUCCESS ? "ok" : "failed");
++			break;
++		}
++		case MHI_PKT_TYPE_RESET_CHAN_CMD: {
++			int id = MHI_TRE_GET_ID(pkt);
++			struct mhi_sat_device *sat_dev;
++
++			sat_dev = find_sat_dev_by_id(sat_cntrl, id,
++						     SAT_CTXT_TYPE_CHAN);
++			if (!sat_dev || !sat_dev->chan_started) {
++				dev_err(dev, "sat: bad RESET for chan %d\n", id);
++				break;
++			}
++
++			mhi_unprepare_from_transfer(sat_dev->mhi_dev);
++			mhi_sat_chan_stopped(sat_dev);
++			code = MHI_EV_CC_SUCCESS;
++
++			dev_dbg(dev, "sat: RESET chan %d ok\n", id);
++			break;
++		}
++		default:
++			dev_err(dev, "sat: unhandled command type %u\n",
++				(u32)MHI_TRE_GET_TYPE(pkt));
++			break;
++		}
++
++		mhi_sat_log(sat_cntrl, log_type, log_id, log_er, log_ptr,
++			    log_size, code);
++
++		pkt->ptr = MHI_TRE_EVT_CMD_COMPLETION_PTR(completion_ptr);
++		pkt->dword[0] = MHI_TRE_EVT_CMD_COMPLETION_D0(code);
++		pkt->dword[1] = MHI_TRE_EVT_CMD_COMPLETION_D1;
++	}
++}
++
++/*
++ * Tell the remote the device is gone so it stops using the shared rings. This
++ * is the only message in the protocol the remote has to acknowledge; everything
++ * else we send is an event it may silently ignore.
++ *
++ * The caller holds cmd_wait_mutex and does the waiting, so that a probe can
++ * wait for the reply on its own terms.
++ */
++static int mhi_sat_send_sys_err_cmd(struct mhi_sat_cntrl *sat_cntrl)
++{
++	struct sat_tre *pkt;
++	void *msg;
++	int ret;
++
++	msg = kzalloc(SAT_MSG_SIZE(1), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	pkt = SAT_TRE_OFFSET(msg);
++	pkt->ptr = MHI_TRE_CMD_SYS_ERR_PTR;
++	pkt->dword[0] = MHI_TRE_CMD_SYS_ERR_D0;
++	pkt->dword[1] = MHI_TRE_CMD_SYS_ERR_D1;
++
++	/* arm before sending: the reply may beat us back here */
++	reinit_completion(&sat_cntrl->completion);
++
++	ret = mhi_sat_send_msg(sat_cntrl, SAT_MSG_ID_CMD, SAT_RESERVED_SEQ_NUM,
++			       msg, SAT_MSG_SIZE(1));
++	kfree(msg);
++
++	return ret;
++}
++
++static void mhi_sat_send_sys_err(struct mhi_sat_cntrl *sat_cntrl)
++{
++	struct device *dev = sat_cntrl->mhi_cntrl->cntrl_dev;
++	int ret;
++
++	flush_work(&sat_cntrl->connect_work);
++	flush_work(&sat_cntrl->process_work);
++
++	mutex_lock(&sat_cntrl->cmd_wait_mutex);
++
++	ret = mhi_sat_send_sys_err_cmd(sat_cntrl);
++	if (ret)
++		dev_err(dev, "sat: failed to send SYS_ERR: %d\n", ret);
++	else
++		mhi_sat_wait_cmd_completion(sat_cntrl);
++
++	mutex_unlock(&sat_cntrl->cmd_wait_mutex);
++}
++
++static void mhi_sat_error_worker(void *data, async_cookie_t cookie)
++{
++	struct mhi_sat_cntrl *sat_cntrl = data;
++	struct device *dev = sat_cntrl->mhi_cntrl->cntrl_dev;
++	struct sat_tre *pkt;
++	void *msg;
++	int ret;
++
++	flush_work(&sat_cntrl->connect_work);
++	flush_work(&sat_cntrl->process_work);
++
++	msg = kzalloc(SAT_MSG_SIZE(1), GFP_KERNEL);
++	if (!msg)
++		return;
++
++	pkt = SAT_TRE_OFFSET(msg);
++	pkt->ptr = MHI_TRE_EVT_MHI_STATE_PTR;
++	pkt->dword[0] = MHI_TRE_EVT_MHI_STATE_D0(MHI_STATE_SYS_ERR);
++	pkt->dword[1] = MHI_TRE_EVT_MHI_STATE_D1;
++
++	ret = mhi_sat_send_msg(sat_cntrl, SAT_MSG_ID_EVT, SAT_RESERVED_SEQ_NUM,
++			       msg, SAT_MSG_SIZE(1));
++	kfree(msg);
++
++	dev_dbg(dev, "sat: SYS_ERR event send %s\n", ret ? "failed" : "ok");
++}
++
++static void mhi_sat_process_worker(struct work_struct *work)
++{
++	struct mhi_sat_cntrl *sat_cntrl = container_of(work,
++					struct mhi_sat_cntrl, process_work);
++	struct mhi_sat_packet *packet, *tmp;
++	struct sat_header *hdr;
++	struct sat_tre *pkt;
++	LIST_HEAD(head);
++
++	spin_lock_irq(&sat_cntrl->pkt_lock);
++	list_splice_tail_init(&sat_cntrl->packet_list, &head);
++	spin_unlock_irq(&sat_cntrl->pkt_lock);
++
++	list_for_each_entry_safe(packet, tmp, &head, node) {
++		hdr = packet->msg;
++		pkt = SAT_TRE_OFFSET(packet->msg);
++
++		list_del(&packet->node);
++
++		if (!MHI_SAT_ACTIVE(sat_cntrl))
++			goto next;
++
++		mhi_sat_process_cmds(sat_cntrl, hdr, pkt);
++
++		/* the rewritten packets are the response events */
++		mhi_sat_send_msg(sat_cntrl, SAT_MSG_ID_EVT, hdr->seq,
++				 packet->msg,
++				 SAT_MSG_SIZE(SAT_TRE_NUM_PKTS(hdr->payload_size)));
++next:
++		kfree(packet);
++	}
++}
++
++/*
++ * Tell the remote where the MHI registers live, which event rings it owns, and
++ * that the device is already in M0/AMSS (the AP brought it up long before).
++ * The remote is not expected to answer, only to start asking for its channels.
++ */
++static int mhi_sat_send_hello(struct mhi_sat_cntrl *sat_cntrl)
++{
++	struct sat_tre *pkt;
++	void *msg;
++	int ret;
++
++	msg = kzalloc(SAT_MSG_SIZE(3), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	pkt = SAT_TRE_OFFSET(msg);
++
++	pkt->ptr = MHI_TRE_EVT_CFG_PTR(sat_cntrl->base_addr);
++	pkt->dword[0] = MHI_TRE_EVT_CFG_D0(sat_cntrl->er_base,
++					   sat_cntrl->num_er);
++	pkt->dword[1] = MHI_TRE_EVT_CFG_D1;
++	pkt++;
++
++	pkt->ptr = MHI_TRE_EVT_MHI_STATE_PTR;
++	pkt->dword[0] = MHI_TRE_EVT_MHI_STATE_D0(MHI_STATE_M0);
++	pkt->dword[1] = MHI_TRE_EVT_MHI_STATE_D1;
++	pkt++;
++
++	pkt->ptr = MHI_TRE_EVT_EE_PTR;
++	pkt->dword[0] = MHI_TRE_EVT_EE_D0(MHI_EE_AMSS);
++	pkt->dword[1] = MHI_TRE_EVT_EE_D1;
++
++	ret = mhi_sat_send_msg(sat_cntrl, SAT_MSG_ID_EVT, SAT_RESERVED_SEQ_NUM,
++			       msg, SAT_MSG_SIZE(3));
++	kfree(msg);
++
++	if (!ret)
++		sat_cntrl->hellos++;
++
++	return ret;
++}
++
++/* Greet the remote once the link is up and every shared channel has probed. */
++static void mhi_sat_connect_worker(struct work_struct *work)
++{
++	struct mhi_sat_cntrl *sat_cntrl = container_of(work,
++					struct mhi_sat_cntrl, connect_work);
++	struct device *dev = sat_cntrl->mhi_cntrl->cntrl_dev;
++	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
++	enum mhi_sat_state prev_state;
++	int ret;
++
++	spin_lock_irq(&sat_cntrl->state_lock);
++	if (!subsys->rpdev ||
++	    sat_cntrl->max_devices != sat_cntrl->num_devices ||
++	    !MHI_SAT_ALLOW_CONN(sat_cntrl)) {
++		spin_unlock_irq(&sat_cntrl->state_lock);
++		return;
++	}
++	prev_state = sat_cntrl->state;
++	sat_cntrl->state = SAT_RUNNING;
++	mhi_sat_mark_transition();
++	spin_unlock_irq(&sat_cntrl->state_lock);
++
++	ret = mhi_sat_send_hello(sat_cntrl);
++	if (ret) {
++		dev_err(dev, "sat: failed to send hello: %d\n", ret);
++		goto err;
++	}
++
++	dev_info(dev, "sat: %s link up, device 0x%x greeted (er %d..%d)\n",
++		 subsys->name, sat_cntrl->dev_id, sat_cntrl->er_base,
++		 sat_cntrl->er_max);
++	return;
++
++err:
++	spin_lock_irq(&sat_cntrl->state_lock);
++	if (MHI_SAT_ACTIVE(sat_cntrl))
++		sat_cntrl->state = prev_state;
++		mhi_sat_mark_transition();
++	spin_unlock_irq(&sat_cntrl->state_lock);
++}
++
++static struct dentry *mhi_sat_debugfs_root;
++
++/*
++ * Everything the host knows about one satellite link, so a silent remote can be
++ * told apart from a link that was never offered anything: whether the rpmsg
++ * channel exists, whether all the lent channels probed (the hello is only sent
++ * once they have), what the hello claimed, and how much has been said in each
++ * direction since.
++ */
++static int mhi_sat_status_show(struct seq_file *s, void *unused)
++{
++	struct mhi_sat_cntrl *sat_cntrl = s->private;
++	enum mhi_sat_state state = sat_cntrl->state;
++
++	seq_printf(s, "subsys:     %s\n", sat_cntrl->subsys->name);
++	seq_printf(s, "link:       %s\n",
++		   sat_cntrl->subsys->rpdev ? "up" : "down");
++	seq_printf(s, "state:      %s\n",
++		   state < SAT_STATE_MAX ? sat_state_str[state] : "invalid");
++	seq_printf(s, "dev id:     0x%08x\n", sat_cntrl->dev_id);
++	seq_printf(s, "mmio base:  %pap\n", &sat_cntrl->base_addr);
++	seq_printf(s, "devices:    %d of %d\n", sat_cntrl->num_devices,
++		   sat_cntrl->max_devices);
++	seq_printf(s, "event ring: %d..%d (%d)\n", sat_cntrl->er_base,
++		   sat_cntrl->er_max, sat_cntrl->num_er);
++	seq_printf(s, "tx:         %u messages, %u hellos, last cmd seq %u\n",
++		   sat_cntrl->seq, sat_cntrl->hellos, sat_cntrl->last_cmd_seq);
++	seq_printf(s, "rx:         %u commands, %u events\n",
++		   sat_cntrl->rx_cmds, sat_cntrl->rx_evts);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mhi_sat_status);
++
++static const char *mhi_sat_cmd_str(u8 type)
++{
++	switch (type) {
++	case MHI_PKT_TYPE_IOMMU_MAP_CMD:
++		return "IOMMU_MAP";
++	case MHI_PKT_TYPE_CTXT_UPDATE_CMD:
++		return "CTXT_UPDATE";
++	case MHI_PKT_TYPE_START_CHAN_CMD:
++		return "START_CHAN";
++	case MHI_PKT_TYPE_RESET_CHAN_CMD:
++		return "RESET_CHAN";
++	default:
++		return "UNKNOWN";
++	}
++}
++
++static int mhi_sat_log_show(struct seq_file *s, void *unused)
++{
++	struct mhi_sat_cntrl *sat_cntrl = s->private;
++	struct mhi_sat_log_entry *log;
++	unsigned int next, i, n;
++	unsigned long flags;
++
++	log = kmalloc_array(MHI_SAT_LOG_ENTRIES, sizeof(*log), GFP_KERNEL);
++	if (!log)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&sat_cntrl->log_lock, flags);
++	memcpy(log, sat_cntrl->log, MHI_SAT_LOG_ENTRIES * sizeof(*log));
++	next = sat_cntrl->log_next;
++	spin_unlock_irqrestore(&sat_cntrl->log_lock, flags);
++
++	if (!next) {
++		seq_puts(s, "(the remote has asked for nothing)\n");
++		goto out;
++	}
++
++	n = min_t(unsigned int, next, MHI_SAT_LOG_ENTRIES);
++
++	for (i = next - n; i < next; i++) {
++		struct mhi_sat_log_entry *e = &log[i % MHI_SAT_LOG_ENTRIES];
++
++		seq_printf(s, "[%5llu.%06llu] %-11s ", e->ts / NSEC_PER_SEC,
++			   (e->ts % NSEC_PER_SEC) / 1000, mhi_sat_cmd_str(e->type));
++
++		switch (e->type) {
++		case MHI_PKT_TYPE_IOMMU_MAP_CMD:
++			seq_printf(s, "phys 0x%016llx size %u", e->ptr, e->size);
++			break;
++		case MHI_PKT_TYPE_CTXT_UPDATE_CMD:
++			seq_printf(s, "%s %-3u base 0x%016llx size %u",
++				   e->er ? "ring" : "chan", e->id, e->ptr,
++				   e->size);
++			break;
++		default:
++			seq_printf(s, "chan %-3u", e->id);
++			break;
++		}
++
++		seq_printf(s, "  -> %s\n",
++			   e->ccs == MHI_EV_CC_SUCCESS ? "granted" : "REFUSED");
++	}
++
++out:
++	kfree(log);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mhi_sat_log);
++
++/* Send the hello again. Reading this file is the trigger. */
++static int mhi_sat_hello_show(struct seq_file *s, void *unused)
++{
++	struct mhi_sat_cntrl *sat_cntrl = s->private;
++	int ret;
++
++	if (!sat_cntrl->subsys->rpdev) {
++		seq_puts(s, "no link\n");
++		return 0;
++	}
++
++	ret = mhi_sat_send_hello(sat_cntrl);
++	seq_printf(s, "hello seq %u: %s (%d)\n", sat_cntrl->seq,
++		   ret ? "failed" : "sent", ret);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mhi_sat_hello);
++
++/*
++ * Is the remote's satellite client listening at all?
++ *
++ * Nothing it is normally sent requires an answer, so a client that is loaded
++ * but uninterested looks exactly like one that was never started. SYS_ERR is
++ * the exception: the remote must acknowledge it. An ack therefore means the
++ * client is alive and reading our messages, and the reason it never asks for
++ * its channels lies inside it; silence means our messages are not reaching it
++ * at all, which is a problem on this side of the link.
++ *
++ * Note this tells the remote the device has died. A client that believes it
++ * will not come back for the rest of this boot, so probe last.
++ */
++#define MHI_SAT_PROBE_TIMEOUT_MS	2000
++
++static int mhi_sat_probe_show(struct seq_file *s, void *unused)
++{
++	struct mhi_sat_cntrl *sat_cntrl = s->private;
++	unsigned long left;
++	int ret;
++
++	if (!sat_cntrl->subsys->rpdev) {
++		seq_puts(s, "no link\n");
++		return 0;
++	}
++
++	mutex_lock(&sat_cntrl->cmd_wait_mutex);
++
++	ret = mhi_sat_send_sys_err_cmd(sat_cntrl);
++	if (ret) {
++		seq_printf(s, "SYS_ERR: send failed (%d)\n", ret);
++		goto out;
++	}
++
++	seq_printf(s, "SYS_ERR: sent, seq %u\n", sat_cntrl->last_cmd_seq);
++
++	left = wait_for_completion_timeout(&sat_cntrl->completion,
++				msecs_to_jiffies(MHI_SAT_PROBE_TIMEOUT_MS));
++	if (left)
++		seq_printf(s, "reply:   acked, ccs %d -- remote is listening\n",
++			   sat_cntrl->last_cmd_ccs);
++	else
++		seq_printf(s, "reply:   none after %u ms -- remote is silent\n",
++			   MHI_SAT_PROBE_TIMEOUT_MS);
++
++out:
++	mutex_unlock(&sat_cntrl->cmd_wait_mutex);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mhi_sat_probe);
++
++/*
++ * Is the remote actually talking to the device?
++ *
++ * Once its channels are started the remote drives them itself: it writes the
++ * doorbell registers in the device's own address space and reads its events
++ * straight out of a ring the host must not touch. None of that is visible from
++ * here, so a remote that has been given everything and does nothing looks
++ * exactly like one that is working -- which is the state this board is in, with
++ * a voice call established and not one byte crossing the mailbox.
++ *
++ * The doorbells themselves are readable, though. They live in the device's
++ * MMIO, which the host maps, and they hold the last value written. Read them
++ * twice around something the remote should be doing, and a value that has
++ * moved says it is sending; one that has not says it never tried. That splits
++ * the fault cleanly in two, which nothing on the host side can.
++ */
++/*
++ * How often the remote rings, rather than what it rings with.
++ *
++ * The rings themselves are in memory the remote owns and the host does not
++ * map, and on this SoC reading that memory from here risks a permission fault
++ * that takes the whole board down -- so the buffers stay untouched. The
++ * doorbells alone still separate the two things worth telling apart: a stream
++ * moves them steadily for as long as it runs, while session and control
++ * traffic moves them in bursts around whatever provoked it.
++ */
++#define MHI_SAT_WATCH_INTERVAL_MS	20
++#define MHI_SAT_WATCH_SAMPLES		250	/* five seconds of them */
++
++struct mhi_sat_watch {
++	u32 off;
++	u64 last;
++	unsigned int changes;
++	unsigned int first_ms;
++	unsigned int last_ms;
++	int id;
++	bool ring;
++};
++
++static bool mhi_sat_watch_read(struct mhi_controller *mhi_cntrl, u32 off,
++			       u64 *val)
++{
++	u32 lo, hi;
++
++	if (mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, off, &lo) ||
++	    mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, off + 4, &hi))
++		return false;
++
++	*val = ((u64)hi << 32) | lo;
++	return true;
++}
++
++static int mhi_sat_cadence_show(struct seq_file *s, void *unused)
++{
++	struct mhi_sat_cntrl *sat_cntrl = s->private;
++	struct mhi_controller *mhi_cntrl = sat_cntrl->mhi_cntrl;
++	struct mhi_sat_device *sat_dev;
++	struct mhi_sat_watch *w;
++	unsigned int n = 0, i, j;
++	u32 chdb_off, er_off;
++	int ret;
++
++	ret = mhi_get_channel_doorbell_offset(mhi_cntrl, &chdb_off);
++	if (ret)
++		return ret;
++
++	ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, ERDBOFF, &er_off);
++	if (ret)
++		return ret;
++
++	w = kcalloc(MHI_SAT_MAX_DEVICES + sat_cntrl->er_max + 1, sizeof(*w),
++		    GFP_KERNEL);
++	if (!w)
++		return -ENOMEM;
++
++	mutex_lock(&sat_cntrl->list_mutex);
++	list_for_each_entry(sat_dev, &sat_cntrl->dev_list, node) {
++		struct mhi_device *mhi_dev = sat_dev->mhi_dev;
++
++		w[n].id = mhi_dev->dl_chan_id ?: mhi_dev->ul_chan_id;
++		w[n].off = chdb_off + (8 * w[n].id);
++		n++;
++	}
++	mutex_unlock(&sat_cntrl->list_mutex);
++
++	for (i = sat_cntrl->er_base; i <= sat_cntrl->er_max; i++) {
++		w[n].id = i;
++		w[n].off = er_off + (8 * i);
++		w[n].ring = true;
++		n++;
++	}
++
++	for (i = 0; i < n; i++)
++		mhi_sat_watch_read(mhi_cntrl, w[i].off, &w[i].last);
++
++	for (j = 0; j < MHI_SAT_WATCH_SAMPLES; j++) {
++		unsigned int ms = j * MHI_SAT_WATCH_INTERVAL_MS;
++
++		msleep(MHI_SAT_WATCH_INTERVAL_MS);
++
++		for (i = 0; i < n; i++) {
++			u64 val;
++
++			if (!mhi_sat_watch_read(mhi_cntrl, w[i].off, &val))
++				continue;
++			if (val == w[i].last)
++				continue;
++
++			if (!w[i].changes)
++				w[i].first_ms = ms;
++			w[i].last_ms = ms;
++			w[i].changes++;
++			w[i].last = val;
++		}
++	}
++
++	seq_printf(s, "%u samples over %u ms\n\n", MHI_SAT_WATCH_SAMPLES,
++		   MHI_SAT_WATCH_SAMPLES * MHI_SAT_WATCH_INTERVAL_MS);
++	seq_printf(s, "%-12s %-8s %-9s %-9s %s\n",
++		   "doorbell", "moves", "first ms", "last ms", "mean gap ms");
++
++	for (i = 0; i < n; i++) {
++		unsigned int gap = 0;
++
++		if (w[i].changes > 1)
++			gap = (w[i].last_ms - w[i].first_ms) / (w[i].changes - 1);
++
++		seq_printf(s, "%-5s %-6d %-8u %-9u %-9u %u\n",
++			   w[i].ring ? "ring" : "chan", w[i].id, w[i].changes,
++			   w[i].first_ms, w[i].last_ms, gap);
++	}
++
++	kfree(w);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mhi_sat_cadence);
++
++static int mhi_sat_doorbells_show(struct seq_file *s, void *unused)
++{
++	struct mhi_sat_cntrl *sat_cntrl = s->private;
++	struct mhi_controller *mhi_cntrl = sat_cntrl->mhi_cntrl;
++	struct mhi_sat_device *sat_dev;
++	u32 chdb_off, er_off;
++	int ret;
++
++	ret = mhi_get_channel_doorbell_offset(mhi_cntrl, &chdb_off);
++	if (ret) {
++		seq_printf(s, "cannot read the doorbell offset: %d\n", ret);
++		return 0;
++	}
++
++	ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, ERDBOFF, &er_off);
++	if (ret) {
++		seq_printf(s, "cannot read the event doorbell offset: %d\n", ret);
++		return 0;
++	}
++
++	seq_printf(s, "%-14s %-10s %s\n", "doorbell", "offset", "value");
++
++	mutex_lock(&sat_cntrl->list_mutex);
++	list_for_each_entry(sat_dev, &sat_cntrl->dev_list, node) {
++		struct mhi_device *mhi_dev = sat_dev->mhi_dev;
++		int chan = mhi_dev->dl_chan_id ?: mhi_dev->ul_chan_id;
++		u32 off = chdb_off + (8 * chan);
++		u32 lo, hi;
++
++		if (mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, off, &lo) ||
++		    mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, off + 4, &hi)) {
++			seq_printf(s, "chan %-9d 0x%08x unreadable\n", chan, off);
++			continue;
++		}
++
++		seq_printf(s, "chan %-9d 0x%08x 0x%08x%08x%s\n", chan, off, hi, lo,
++			   sat_dev->chan_started ? "" : " (not started)");
++	}
++	mutex_unlock(&sat_cntrl->list_mutex);
++
++	/* The rings the remote was handed, so its own consumption shows too. */
++	for (ret = sat_cntrl->er_base; ret <= sat_cntrl->er_max; ret++) {
++		u32 off = er_off + (8 * ret);
++		u32 lo, hi;
++
++		if (mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, off, &lo) ||
++		    mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, off + 4, &hi)) {
++			seq_printf(s, "ring %-9d 0x%08x unreadable\n", ret, off);
++			continue;
++		}
++
++		seq_printf(s, "ring %-9d 0x%08x 0x%08x%08x\n", ret, off, hi, lo);
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mhi_sat_doorbells);
++
++static void mhi_sat_debugfs_create(struct mhi_sat_cntrl *sat_cntrl)
++{
++	char name[32];
++
++	snprintf(name, sizeof(name), "%s-%08x", sat_cntrl->subsys->name,
++		 sat_cntrl->dev_id);
++
++	sat_cntrl->dbgfs = debugfs_create_dir(name, mhi_sat_debugfs_root);
++
++	debugfs_create_file("status", 0444, sat_cntrl->dbgfs, sat_cntrl,
++			    &mhi_sat_status_fops);
++	debugfs_create_file("log", 0444, sat_cntrl->dbgfs, sat_cntrl,
++			    &mhi_sat_log_fops);
++	debugfs_create_file("doorbells", 0444, sat_cntrl->dbgfs, sat_cntrl,
++			    &mhi_sat_doorbells_fops);
++	debugfs_create_file("cadence", 0444, sat_cntrl->dbgfs, sat_cntrl,
++			    &mhi_sat_cadence_fops);
++	debugfs_create_file("hello", 0400, sat_cntrl->dbgfs, sat_cntrl,
++			    &mhi_sat_hello_fops);
++	debugfs_create_file("probe", 0400, sat_cntrl->dbgfs, sat_cntrl,
++			    &mhi_sat_probe_fops);
++}
++
++static void mhi_sat_process_events(struct mhi_sat_cntrl *sat_cntrl,
++				   struct sat_header *hdr, struct sat_tre *pkt)
++{
++	int num_pkts = SAT_TRE_NUM_PKTS(hdr->payload_size);
++	int i;
++
++	for (i = 0; i < num_pkts; i++, pkt++) {
++		if (MHI_TRE_GET_TYPE(pkt) != MHI_PKT_TYPE_CMD_COMPLETION_EVENT)
++			continue;
++
++		if (hdr->reply_seq != sat_cntrl->last_cmd_seq)
++			continue;
++
++		sat_cntrl->last_cmd_ccs = MHI_TRE_GET_CCS(pkt);
++		complete(&sat_cntrl->completion);
++	}
++}
++
++static int mhi_sat_rpmsg_cb(struct rpmsg_device *rpdev, void *data, int len,
++			    void *priv, u32 src)
++{
++	struct mhi_sat_subsys *subsys = dev_get_drvdata(&rpdev->dev);
++	struct sat_header *hdr = data;
++	struct sat_tre *pkt = SAT_TRE_OFFSET(data);
++	struct mhi_sat_cntrl *sat_cntrl;
++	struct mhi_sat_packet *packet;
++	unsigned long flags;
++
++	if (!mhi_sat_isvalid_header(hdr, len)) {
++		dev_err(&rpdev->dev, "sat: invalid header\n");
++		return 0;
++	}
++
++	dev_dbg(&rpdev->dev,
++		"sat: rx dev 0x%x msg 0x%x seq %u reply_seq %u payload %u\n",
++		hdr->dev_id, hdr->msg_id, hdr->seq, hdr->reply_seq,
++		hdr->payload_size);
++
++	sat_cntrl = find_sat_cntrl_by_id(subsys, hdr->dev_id);
++	if (!sat_cntrl) {
++		/*
++		 * The remote is talking about a device we never announced. Say
++		 * so: dropping this silently makes an id mismatch look exactly
++		 * like a remote that never said anything at all.
++		 */
++		dev_warn_once(&rpdev->dev,
++			      "sat: message for unknown device 0x%x, dropping\n",
++			      hdr->dev_id);
++		return 0;
++	}
++
++	/*
++	 * The remote has never been heard from on some boards, so say when it
++	 * first is -- without needing dynamic debug armed beforehand to catch it.
++	 */
++	if (!sat_cntrl->rx_cmds && !sat_cntrl->rx_evts)
++		dev_info(&rpdev->dev, "sat: first message from %s, msg 0x%x\n",
++			 subsys->name, hdr->msg_id);
++
++	/* completions are handled inline regardless of state */
++	if (hdr->msg_id == SAT_MSG_ID_EVT) {
++		sat_cntrl->rx_evts++;
++		mhi_sat_process_events(sat_cntrl, hdr, pkt);
++		return 0;
++	}
++
++	sat_cntrl->rx_cmds++;
++
++	if (unlikely(!MHI_SAT_ACTIVE(sat_cntrl))) {
++		dev_warn_once(&rpdev->dev,
++			      "sat: msg 0x%x for device 0x%x while state %d, dropping\n",
++			      hdr->msg_id, hdr->dev_id, sat_cntrl->state);
++		return 0;
++	}
++
++	/* commands may sleep (DMA mapping, channel start): defer to a worker */
++	packet = kmalloc(sizeof(*packet) + len, GFP_ATOMIC);
++	if (!packet)
++		return 0;
++
++	packet->cntrl = sat_cntrl;
++	packet->msg = packet + 1;
++	memcpy(packet->msg, data, len);
++
++	spin_lock_irqsave(&sat_cntrl->pkt_lock, flags);
++	list_add_tail(&packet->node, &sat_cntrl->packet_list);
++	spin_unlock_irqrestore(&sat_cntrl->pkt_lock, flags);
++
++	schedule_work(&sat_cntrl->process_work);
++
++	return 0;
++}
++
++static void mhi_sat_free_addr_map(struct mhi_sat_cntrl *sat_cntrl)
++{
++	struct mhi_sat_addr_map *map, *tmp;
++
++	list_for_each_entry_safe(map, tmp, &sat_cntrl->addr_map_list, node) {
++		dma_unmap_resource(sat_cntrl->mhi_cntrl->cntrl_dev,
++				   map->dma_addr, map->len,
++				   DMA_BIDIRECTIONAL, 0);
++		list_del(&map->node);
++		kfree(map);
++	}
++}
++
++static void mhi_sat_rpmsg_remove(struct rpmsg_device *rpdev)
++{
++	struct mhi_sat_subsys *subsys = dev_get_drvdata(&rpdev->dev);
++	struct mhi_sat_cntrl *sat_cntrl;
++	struct mhi_sat_device *sat_dev;
++
++	mutex_lock(&subsys->cntrl_mutex);
++	list_for_each_entry(sat_cntrl, &subsys->cntrl_list, node) {
++		async_synchronize_cookie(sat_cntrl->error_cookie + 1);
++
++		spin_lock_irq(&sat_cntrl->state_lock);
++		if (MHI_SAT_IN_ERROR(sat_cntrl)) {
++			sat_cntrl->state = SAT_DISABLED;
++			mhi_sat_mark_transition();
++			spin_unlock_irq(&sat_cntrl->state_lock);
++			continue;
++		}
++		sat_cntrl->state = SAT_DISCONNECTED;
++		mhi_sat_mark_transition();
++		spin_unlock_irq(&sat_cntrl->state_lock);
++
++		flush_work(&sat_cntrl->connect_work);
++		flush_work(&sat_cntrl->process_work);
++
++		mutex_lock(&sat_cntrl->list_mutex);
++		list_for_each_entry(sat_dev, &sat_cntrl->dev_list, node) {
++			if (sat_dev->chan_started) {
++				mhi_unprepare_from_transfer(sat_dev->mhi_dev);
++				mhi_sat_chan_stopped(sat_dev);
++			}
++		}
++		mhi_sat_free_addr_map(sat_cntrl);
++		mutex_unlock(&sat_cntrl->list_mutex);
++	}
++	subsys->rpdev = NULL;
++	mutex_unlock(&subsys->cntrl_mutex);
++}
++
++static int mhi_sat_rpmsg_probe(struct rpmsg_device *rpdev)
++{
++	struct mhi_sat_subsys *subsys;
++	struct mhi_sat_cntrl *sat_cntrl;
++	const char *subsys_name;
++	int ret;
++
++	/*
++	 * The glink edge node's label names the remote ("lpass", "dsps"),
++	 * which is how we tell the ADSP link from the sensor DSP one.
++	 */
++	ret = of_property_read_string(rpdev->dev.parent->of_node, "label",
++				      &subsys_name);
++	if (ret)
++		return ret;
++
++	subsys = find_subsys_by_name(subsys_name);
++	if (!subsys)
++		return -EINVAL;
++
++	mutex_lock(&subsys->cntrl_mutex);
++
++	dev_set_drvdata(&rpdev->dev, subsys);
++	subsys->rpdev = rpdev;
++
++	spin_lock_irq(&subsys->cntrl_lock);
++	list_for_each_entry(sat_cntrl, &subsys->cntrl_list, node)
++		schedule_work(&sat_cntrl->connect_work);
++	spin_unlock_irq(&subsys->cntrl_lock);
++
++	mutex_unlock(&subsys->cntrl_mutex);
++
++	dev_info(&rpdev->dev, "sat: %s satellite link ready\n", subsys->name);
++
++	return 0;
++}
++
++static struct rpmsg_device_id mhi_sat_rpmsg_match_table[] = {
++	{ .name = "mhi_sat" },
++	{},
++};
++MODULE_DEVICE_TABLE(rpmsg, mhi_sat_rpmsg_match_table);
++
++static struct rpmsg_driver mhi_sat_rpmsg_driver = {
++	.id_table = mhi_sat_rpmsg_match_table,
++	.probe = mhi_sat_rpmsg_probe,
++	.remove = mhi_sat_rpmsg_remove,
++	.callback = mhi_sat_rpmsg_cb,
++	.drv = {
++		.name = "mhi,sat_rpmsg",
++	},
++};
++
++static void mhi_sat_dev_status_cb(struct mhi_device *mhi_dev,
++				  enum mhi_callback mhi_cb)
++{
++	struct mhi_sat_device *sat_dev = dev_get_drvdata(&mhi_dev->dev);
++	struct mhi_sat_cntrl *sat_cntrl;
++	unsigned long flags;
++
++	if (mhi_cb != MHI_CB_FATAL_ERROR || !sat_dev)
++		return;
++
++	sat_cntrl = sat_dev->cntrl;
++
++	spin_lock_irqsave(&sat_cntrl->state_lock, flags);
++	if (MHI_SAT_ACTIVE(sat_cntrl)) {
++		sat_cntrl->error_cookie = async_schedule(mhi_sat_error_worker,
++							 sat_cntrl);
++		sat_cntrl->state = SAT_FATAL_DETECT;
++		mhi_sat_mark_transition();
++	} else {
++		sat_cntrl->state = SAT_DISABLED;
++		mhi_sat_mark_transition();
++	}
++	spin_unlock_irqrestore(&sat_cntrl->state_lock, flags);
++}
++
++static void mhi_sat_dev_remove(struct mhi_device *mhi_dev)
++{
++	struct mhi_sat_device *sat_dev = dev_get_drvdata(&mhi_dev->dev);
++	struct mhi_sat_cntrl *sat_cntrl = sat_dev->cntrl;
++	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
++	bool send_sys_err = false;
++
++	mutex_lock(&sat_cntrl->list_mutex);
++	list_del(&sat_dev->node);
++	mutex_unlock(&sat_cntrl->list_mutex);
++
++	sat_cntrl->num_devices--;
++
++	mutex_lock(&subsys->cntrl_mutex);
++
++	async_synchronize_cookie(sat_cntrl->error_cookie + 1);
++
++	spin_lock_irq(&sat_cntrl->state_lock);
++	if (MHI_SAT_ALLOW_SYS_ERR(sat_cntrl))
++		send_sys_err = true;
++	sat_cntrl->state = SAT_ERROR;
++	mhi_sat_mark_transition();
++	spin_unlock_irq(&sat_cntrl->state_lock);
++
++	if (send_sys_err)
++		mhi_sat_send_sys_err(sat_cntrl);
++
++	if (sat_cntrl->num_devices) {
++		mutex_unlock(&subsys->cntrl_mutex);
++		return;
++	}
++
++	debugfs_remove_recursive(sat_cntrl->dbgfs);
++
++	cancel_work_sync(&sat_cntrl->connect_work);
++	cancel_work_sync(&sat_cntrl->process_work);
++
++	mutex_lock(&sat_cntrl->list_mutex);
++	mhi_sat_free_addr_map(sat_cntrl);
++	mutex_unlock(&sat_cntrl->list_mutex);
++
++	spin_lock_irq(&subsys->cntrl_lock);
++	list_del(&sat_cntrl->node);
++	spin_unlock_irq(&subsys->cntrl_lock);
++
++	mutex_destroy(&sat_cntrl->cmd_wait_mutex);
++	mutex_destroy(&sat_cntrl->list_mutex);
++	kfree(sat_cntrl);
++
++	mutex_unlock(&subsys->cntrl_mutex);
++}
++
++/*
++ * A unique id for the controller, as the remote knows it. Downstream builds it
++ * from the MHI device's PCI topology fields; mainline keeps that on the PCI
++ * device itself, so derive it from there.
++ */
++static u32 mhi_sat_dev_id(struct mhi_controller *mhi_cntrl)
++{
++	struct device *cntrl_dev = mhi_cntrl->cntrl_dev;
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(cntrl_dev))
++		return 0;
++
++	pdev = to_pci_dev(cntrl_dev);
++
++	return (pdev->device & 0xFFFF) << 16 |
++	       (pci_domain_nr(pdev->bus) & 0xF) << 12 |
++	       (pdev->bus->number & 0xFF) << 4 |
++	       (PCI_SLOT(pdev->devfn) & 0xF);
++}
++
++static phys_addr_t mhi_sat_base_addr(struct mhi_controller *mhi_cntrl)
++{
++	struct device *cntrl_dev = mhi_cntrl->cntrl_dev;
++
++	if (!dev_is_pci(cntrl_dev))
++		return 0;
++
++	/* MHI MMIO lives in BAR 0 on every controller this driver serves */
++	return pci_resource_start(to_pci_dev(cntrl_dev), 0);
++}
++
++static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
++			     const struct mhi_device_id *id)
++{
++	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
++	struct mhi_sat_subsys *subsys = &mhi_sat_subsys_array[id->driver_data];
++	struct mhi_sat_cntrl *sat_cntrl;
++	struct mhi_sat_device *sat_dev;
++	u32 dev_id = mhi_sat_dev_id(mhi_cntrl);
++	int er_index = mhi_sat_dev_er_index(mhi_dev);
++
++	sat_cntrl = find_sat_cntrl_by_id(subsys, dev_id);
++	if (!sat_cntrl) {
++		sat_cntrl = kzalloc(sizeof(*sat_cntrl), GFP_KERNEL);
++		if (!sat_cntrl)
++			return -ENOMEM;
++
++		sat_cntrl->max_devices = MHI_SAT_MAX_DEVICES;
++		sat_cntrl->dev_id = dev_id;
++		sat_cntrl->base_addr = mhi_sat_base_addr(mhi_cntrl);
++		sat_cntrl->er_base = er_index;
++		sat_cntrl->mhi_cntrl = mhi_cntrl;
++		sat_cntrl->last_cmd_seq = SAT_RESERVED_SEQ_NUM;
++		sat_cntrl->subsys = subsys;
++		init_completion(&sat_cntrl->completion);
++		mutex_init(&sat_cntrl->list_mutex);
++		mutex_init(&sat_cntrl->cmd_wait_mutex);
++		spin_lock_init(&sat_cntrl->pkt_lock);
++		spin_lock_init(&sat_cntrl->state_lock);
++		spin_lock_init(&sat_cntrl->log_lock);
++		INIT_WORK(&sat_cntrl->connect_work, mhi_sat_connect_worker);
++		INIT_WORK(&sat_cntrl->process_work, mhi_sat_process_worker);
++		INIT_LIST_HEAD(&sat_cntrl->dev_list);
++		INIT_LIST_HEAD(&sat_cntrl->addr_map_list);
++		INIT_LIST_HEAD(&sat_cntrl->packet_list);
++
++		mutex_lock(&subsys->cntrl_mutex);
++		spin_lock_irq(&subsys->cntrl_lock);
++		list_add(&sat_cntrl->node, &subsys->cntrl_list);
++		spin_unlock_irq(&subsys->cntrl_lock);
++		mutex_unlock(&subsys->cntrl_mutex);
++
++		mhi_sat_debugfs_create(sat_cntrl);
++	}
++
++	sat_cntrl->er_base = min(sat_cntrl->er_base, er_index);
++	sat_cntrl->er_max = max(sat_cntrl->er_max, er_index);
++
++	sat_dev = devm_kzalloc(&mhi_dev->dev, sizeof(*sat_dev), GFP_KERNEL);
++	if (!sat_dev)
++		return -ENOMEM;
++
++	sat_dev->mhi_dev = mhi_dev;
++	sat_dev->cntrl = sat_cntrl;
++
++	mutex_lock(&sat_cntrl->list_mutex);
++	list_add(&sat_dev->node, &sat_cntrl->dev_list);
++	mutex_unlock(&sat_cntrl->list_mutex);
++
++	dev_set_drvdata(&mhi_dev->dev, sat_dev);
++
++	sat_cntrl->num_devices++;
++
++	if (sat_cntrl->num_devices == sat_cntrl->max_devices) {
++		sat_cntrl->num_er = (sat_cntrl->er_max - sat_cntrl->er_base) + 1;
++		schedule_work(&sat_cntrl->connect_work);
++	}
++
++	return 0;
++}
++
++/* .driver_data holds the subsystem id */
++static const struct mhi_device_id mhi_sat_dev_match_table[] = {
++	{ .chan = "ADSP_0", .driver_data = SUBSYS_ADSP },
++	{ .chan = "ADSP_1", .driver_data = SUBSYS_ADSP },
++	{ .chan = "ADSP_2", .driver_data = SUBSYS_ADSP },
++	{ .chan = "ADSP_3", .driver_data = SUBSYS_ADSP },
++	{ .chan = "SLPI_0", .driver_data = SUBSYS_SLPI },
++	{ .chan = "SLPI_1", .driver_data = SUBSYS_SLPI },
++	{ .chan = "SLPI_2", .driver_data = SUBSYS_SLPI },
++	{ .chan = "SLPI_3", .driver_data = SUBSYS_SLPI },
++	{},
++};
++MODULE_DEVICE_TABLE(mhi, mhi_sat_dev_match_table);
++
++static struct mhi_driver mhi_sat_dev_driver = {
++	.id_table = mhi_sat_dev_match_table,
++	.probe = mhi_sat_dev_probe,
++	.remove = mhi_sat_dev_remove,
++	.status_cb = mhi_sat_dev_status_cb,
++	.driver = {
++		.name = MHI_SAT_DRIVER_NAME,
++	},
++};
++
++static int __init mhi_sat_init(void)
++{
++	struct mhi_sat_subsys *subsys;
++	int i, ret;
++
++	subsys = kcalloc(SUBSYS_MAX, sizeof(*subsys), GFP_KERNEL);
++	if (!subsys)
++		return -ENOMEM;
++
++	mhi_sat_subsys_array = subsys;
++
++	for (i = 0; i < SUBSYS_MAX; i++, subsys++) {
++		subsys->name = subsys_names[i];
++		mutex_init(&subsys->cntrl_mutex);
++		spin_lock_init(&subsys->cntrl_lock);
++		INIT_LIST_HEAD(&subsys->cntrl_list);
++	}
++
++	mhi_sat_debugfs_root = debugfs_create_dir(MHI_SAT_DRIVER_NAME, NULL);
++
++	ret = register_rpmsg_driver(&mhi_sat_rpmsg_driver);
++	if (ret)
++		goto err_free;
++
++	ret = mhi_driver_register(&mhi_sat_dev_driver);
++	if (ret)
++		goto err_rpmsg;
++
++	return 0;
++
++err_rpmsg:
++	unregister_rpmsg_driver(&mhi_sat_rpmsg_driver);
++err_free:
++	debugfs_remove_recursive(mhi_sat_debugfs_root);
++	subsys = mhi_sat_subsys_array;
++	for (i = 0; i < SUBSYS_MAX; i++, subsys++)
++		mutex_destroy(&subsys->cntrl_mutex);
++	kfree(mhi_sat_subsys_array);
++	mhi_sat_subsys_array = NULL;
++
++	return ret;
++}
++
++static void __exit mhi_sat_exit(void)
++{
++	struct mhi_sat_subsys *subsys = mhi_sat_subsys_array;
++	int i;
++
++	mhi_driver_unregister(&mhi_sat_dev_driver);
++	unregister_rpmsg_driver(&mhi_sat_rpmsg_driver);
++
++	debugfs_remove_recursive(mhi_sat_debugfs_root);
++
++	for (i = 0; i < SUBSYS_MAX; i++, subsys++)
++		mutex_destroy(&subsys->cntrl_mutex);
++
++	kfree(mhi_sat_subsys_array);
++	mhi_sat_subsys_array = NULL;
++}
++
++module_init(mhi_sat_init);
++module_exit(mhi_sat_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("MHI satellite driver");
+--- a/drivers/net/wireless/ath/ath11k/mhi.c
++++ b/drivers/net/wireless/ath/ath11k/mhi.c
+@@ -226,12 +226,12 @@
+ 	return 0;
+ }
+ 
+-static int ath11k_mhi_op_runtime_get(struct mhi_controller *mhi_cntrl)
+-{
+-	return 0;
+-}
+-
+-static void ath11k_mhi_op_runtime_put(struct mhi_controller *mhi_cntrl)
++static int ath11k_mhi_op_runtime_get(struct mhi_controller *mhi_cntrl, void *priv)
++{
++	return 0;
++}
++
++static void ath11k_mhi_op_runtime_put(struct mhi_controller *mhi_cntrl, void *priv)
+ {
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -100,12 +100,12 @@
+ 	return 0;
+ }
+ 
+-static int ath12k_mhi_op_runtime_get(struct mhi_controller *mhi_cntrl)
++static int ath12k_mhi_op_runtime_get(struct mhi_controller *mhi_cntrl, void *priv)
+ {
+ 	return 0;
+ }
+ 
+-static void ath12k_mhi_op_runtime_put(struct mhi_controller *mhi_cntrl)
++static void ath12k_mhi_op_runtime_put(struct mhi_controller *mhi_cntrl, void *priv)
+ {
+ }
+ 
+--- a/include/linux/mhi.h
++++ b/include/linux/mhi.h
+@@ -322,9 +322,14 @@
+  * @fw_sz: Firmware image data size for normal booting, used only if fw_image
+  *         is NULL and fbc_download is true (optional)
+  * @edl_image: Firmware image name for emergency download mode (optional)
++ * @amss_image: AMSS firmware image name for FBC mode when SBL and AMSS reside
++ *              in separate files (optional). When set, fw_image is uploaded via
++ *              BHI as the SBL, and amss_image is pre-loaded and pushed to the
++ *              device via BHIe when the device signals SBL execution environment.
+  * @rddm_size: RAM dump size that host should allocate for debugging purpose
+  * @sbl_size: SBL image size downloaded through BHIe (optional)
+- * @seg_len: BHIe vector size (optional)
++ * @seg_len: BHIe vector size for normal firmware loading (optional)
++ * @rddm_seg_len: BHIe vector size for RDDM dump collection (optional)
+  * @reg_len: Length of the MHI MMIO region (required)
+  * @fbc_image: Points to firmware image buffer
+  * @rddm_image: Points to RAM dump buffer
+@@ -364,12 +369,17 @@
+  * @wake_toggle: CB function to assert and de-assert device wake (optional)
+  * @runtime_get: CB function to controller runtime resume (required)
+  * @runtime_put: CB function to decrement pm usage (required)
++ * @time_get: CB function to return host time in microseconds (optional)
++ * @lpm_disable: CB function to disable link-level low power modes (optional)
++ * @lpm_enable: CB function to re-enable link-level low power modes (optional)
++ * @bw_scale: CB function to honor device bandwidth switch request (optional)
+  * @map_single: CB function to create TRE buffer
+  * @unmap_single: CB function to destroy TRE buffer
+  * @read_reg: Read a MHI register via the physical link (required)
+  * @write_reg: Write a MHI register via the physical link (required)
+  * @reset: Controller specific reset function (optional)
+  * @edl_trigger: CB function to trigger EDL mode (optional)
++ * @priv_data: Opaque controller-private data for callback implementations
+  * @buffer_len: Bounce buffer length
+  * @index: Index of the MHI controller instance
+  * @bounce_buf: Use of bounce buffer
+@@ -398,9 +408,11 @@
+ 	const u8 *fw_data;
+ 	size_t fw_sz;
+ 	const char *edl_image;
++	const char *amss_image;
+ 	size_t rddm_size;
+ 	size_t sbl_size;
+ 	size_t seg_len;
++	size_t rddm_seg_len;
+ 	size_t reg_len;
+ 	struct image_info *fbc_image;
+ 	struct image_info *rddm_image;
+@@ -442,8 +454,13 @@
+ 	void (*wake_get)(struct mhi_controller *mhi_cntrl, bool override);
+ 	void (*wake_put)(struct mhi_controller *mhi_cntrl, bool override);
+ 	void (*wake_toggle)(struct mhi_controller *mhi_cntrl);
+-	int (*runtime_get)(struct mhi_controller *mhi_cntrl);
+-	void (*runtime_put)(struct mhi_controller *mhi_cntrl);
++	int (*runtime_get)(struct mhi_controller *mhi_cntrl, void *priv);
++	void (*runtime_put)(struct mhi_controller *mhi_cntrl, void *priv);
++	u64 (*time_get)(struct mhi_controller *mhi_cntrl, void *priv);
++	int (*lpm_disable)(struct mhi_controller *mhi_cntrl, void *priv);
++	int (*lpm_enable)(struct mhi_controller *mhi_cntrl, void *priv);
++	int (*bw_scale)(struct mhi_controller *mhi_cntrl,
++			struct mhi_link_info *link_info);
+ 	int (*map_single)(struct mhi_controller *mhi_cntrl,
+ 			  struct mhi_buf_info *buf);
+ 	void (*unmap_single)(struct mhi_controller *mhi_cntrl,
+@@ -454,6 +471,7 @@
+ 			  u32 val);
+ 	void (*reset)(struct mhi_controller *mhi_cntrl);
+ 	int (*edl_trigger)(struct mhi_controller *mhi_cntrl);
++	void *priv_data;
+ 
+ 	size_t buffer_len;
+ 	int index;
+@@ -620,6 +638,20 @@
+ int mhi_prepare_for_power_up(struct mhi_controller *mhi_cntrl);
+ 
+ /**
++ * mhi_mem_protect - Donate MHI control-path DMA buffers to VMID_MSS_MSA
++ * @mhi_cntrl: MHI controller
++ *
++ * Required on Qualcomm SM8250 platforms with an external SDX55M modem on
++ * PCIe2: TrustZone stage-2 SMMU (SID 0x1d01, CB=12) blocks the modem from
++ * writing to host memory unless the physical pages are donated via SCM.
++ * Call after mhi_prepare_for_power_up() and before mhi_sync_power_up().
++ *
++ * Return: 0 on success, -EOPNOTSUPP if CONFIG_QCOM_SCM is not available,
++ *         or negative errno on failure.
++ */
++int mhi_mem_protect(struct mhi_controller *mhi_cntrl);
++
++/**
+  * mhi_async_power_up - Start MHI power up sequence
+  * @mhi_cntrl: MHI controller
+  */
+@@ -713,6 +745,12 @@
+ enum mhi_state mhi_get_mhi_state(struct mhi_controller *mhi_cntrl);
+ 
+ /**
++ * mhi_poll_events - Poll all MHI event rings without MSI
++ * @mhi_cntrl: MHI controller
++ */
++void mhi_poll_events(struct mhi_controller *mhi_cntrl);
++
++/**
+  * mhi_soc_reset - Trigger a device reset. This can be used as a last resort
+  *		   to reset and recover a device.
+  * @mhi_cntrl: MHI controller
+@@ -741,6 +779,33 @@
+  * device execution environments match and channels are in a DISABLED state.
+  */
+ int mhi_prepare_for_transfer(struct mhi_device *mhi_dev);
++
++/**
++ * mhi_device_configure - configure MHI channel/event contexts
++ * @mhi_dev: Device associated with the channels
++ * @dir: Direction of the channel to configure
++ * @buf: Configuration data array
++ * @elements: Number of configuration elements
++ *
++ * Offload clients use this to install modem-provided CCA/ECA contexts before
++ * preparing an offloaded MHI channel pair for transfer.
++ */
++int mhi_device_configure(struct mhi_device *mhi_dev,
++			 enum dma_data_direction dir,
++			 struct mhi_buf *buf,
++			 int elements);
++
++/**
++ * mhi_get_channel_info - return public channel ids for an MHI device
++ * @mhi_dev: Device associated with the channels
++ * @ul_chan: Filled with uplink channel id, if present
++ * @dl_chan: Filled with downlink channel id, if present
++ * @ul_er: Filled with uplink event ring id, if present
++ * @dl_er: Filled with downlink event ring id, if present
++ */
++void mhi_get_channel_info(struct mhi_device *mhi_dev,
++			  u32 *ul_chan, u32 *dl_chan,
++			  u32 *ul_er, u32 *dl_er);
+ 
+ /**
+  * mhi_unprepare_from_transfer - Reset UL and DL channels for data transfer.

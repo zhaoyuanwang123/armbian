@@ -1,10 +1,10 @@
-config: # This is file 'patch/kernel/archive/sm8250-6.18/0000.patching_config.yaml'
+config: # This is file 'patch/kernel/archive/sm8250-7.2/0000.patching_config.yaml'
 
   # Just some info stuff; not used by the patching scripts
-  name: sm8250-6.18
+  name: sm8250-7.2
   kind: kernel
   type: mainline # or: vendor
-  branch: linux-6.18.y
+  branch: linux-7.2.y
   last-known-good-tag: v6.18.3
   maintainers:
     - { github: rpardini, name: Ricardo Pardini, email: ricardo@pardini.net, armbian-forum: rpardini }

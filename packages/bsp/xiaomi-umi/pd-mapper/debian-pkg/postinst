@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+ldconfig
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    systemctl enable pd-mapper.service >/dev/null 2>&1 || true
+    systemctl restart pd-mapper.service || true
+fi
+exit 0

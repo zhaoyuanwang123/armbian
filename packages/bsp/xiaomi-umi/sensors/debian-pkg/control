@@ -1,0 +1,19 @@
+Package: umi-sensors
+Source: xiaomi-umi-bsp
+Version: 1.0-umi3
+Architecture: arm64
+Maintainer: Zhao_Wang
+Depends: libc6 (>= 2.36), systemd
+Section: admin
+Priority: optional
+Description: Xiaomi Mi 10 (umi) SLPI sensor userspace (one-shot package)
+ hexagonrpcd-umi (linux-msm/hexagonrpc @93f3467 + apollo-sensor-fixes:
+ rooted HexagonFS -R, PD fixes) serving the SLPI sensor PD over
+ /dev/fastrpc-sdsp, plus the sensor registry tree (HexagonFS root),
+ systemd units + umi drop-ins, accelerometer mount-matrix udev rule and
+ fastrpc modules-load glue.
+ .
+ Mirrors the sensor BSP hooks in config/boards/xiaomi-umi.conf, packaged
+ so an already-built trixie rootfs can be brought up by installing this
+ one deb after the 7.2.11-Sa2de-D0000-Pb69e (or newer) kernel/dtb.
+ Requires the kernel to have SLPI enabled (sm8250-xiaomi-umi.dtb).

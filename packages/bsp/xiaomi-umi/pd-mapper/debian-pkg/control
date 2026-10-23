@@ -1,0 +1,16 @@
+Package: umi-pd-mapper
+Source: xiaomi-umi-bsp
+Version: 1.0-umi1
+Architecture: arm64
+Maintainer: Zhao_Wang
+Depends: libc6 (>= 2.36), liblzma5, libqrtr1
+Section: admin
+Priority: optional
+Description: Qualcomm PD mapper for Xiaomi Mi 10 (umi) audio bring-up
+ Cross-compiled linux-msm/pd-mapper. Registers DSP protection-domain
+ maps (parsed from the *.jsn files under /lib/firmware) over qrtr so the
+ ADSP "avs/audio" PD announces via PDR. Without it no APR audio service
+ device is created (q6afe/q6asm/...), the q6afecc clock tree never
+ registers, and the sm8250 sound card stays deferred forever.
+ .
+ Mirrors pmOS's pd-mapper package for device-xiaomi-apollo.

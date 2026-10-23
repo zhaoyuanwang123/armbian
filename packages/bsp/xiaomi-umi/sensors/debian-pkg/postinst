@@ -1,0 +1,37 @@
+#!/bin/sh
+# postinst for umi-sensors: mirrors the board BSP + enable-services hooks
+# in config/boards/xiaomi-umi.conf (trixie branch).
+set -e
+
+case "$1" in
+    configure)
+        # fastrpc system user/group for hexagonrpcd (same as board hook)
+        if ! getent group fastrpc >/dev/null 2>&1; then
+            addgroup --system fastrpc
+        fi
+        if ! getent passwd fastrpc >/dev/null 2>&1; then
+            adduser --system --ingroup fastrpc --no-create-home \
+                --home /nonexistent fastrpc
+        fi
+
+        ldconfig
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            systemctl enable hexagonrpcd-sdsp.service >/dev/null 2>&1 || true
+            # /dev/fastrpc-sdsp only appears once the SLPI is up. If the new
+            # kernel/dtb is not installed yet the unit self-skips on its
+            # ConditionPathExists and starts at the next boot instead.
+            if [ -e /dev/fastrpc-sdsp ]; then
+                systemctl restart hexagonrpcd-sdsp.service || true
+            fi
+        fi
+
+        # Mount-matrix rule: reload and re-run misc uevents so the
+        # fastrpc-* devices pick up ACCEL_MOUNT_MATRIX without a reboot.
+        udevadm control --reload >/dev/null 2>&1 || true
+        udevadm trigger --subsystem-match=misc >/dev/null 2>&1 || true
+        ;;
+esac
+
+exit 0

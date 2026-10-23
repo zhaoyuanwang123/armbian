@@ -1,0 +1,10 @@
+--- a/drivers/power/supply/power_supply_sysfs.c
++++ b/drivers/power/supply/power_supply_sysfs.c
+@@ -227,6 +227,7 @@
+ 	POWER_SUPPLY_ATTR(MANUFACTURE_DAY),
+ 	POWER_SUPPLY_ATTR(INTERNAL_RESISTANCE),
+ 	POWER_SUPPLY_ATTR(STATE_OF_HEALTH),
++	POWER_SUPPLY_ATTR(CHARGING_ENABLED),
+ 	/* Properties of type `const char *' */
+ 	POWER_SUPPLY_ATTR(MODEL_NAME),
+ 	POWER_SUPPLY_ATTR(MANUFACTURER),

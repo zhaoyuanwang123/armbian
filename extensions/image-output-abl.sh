@@ -53,29 +53,26 @@ function post_build_image__900_convert_to_abl_img() {
 		for dtb_name in "${ABL_DTB_LIST[@]}"; do
 			display_alert "Creatng abl kernel boot image with dtb ${dtb_name} and cmdline ${bootimg_cmdline} " "${EXTENSION}" "info"
 			cat "${DESTIMG}/Image.gz" "${new_rootfs_image_mount_dir}"/usr/lib/linux-image-*/qcom/"${dtb_name}.dtb" > "${DESTIMG}/Image.gz-${dtb_name}"
+			# Header v4, no ramdisk, no legacy offsets, matching the official Honor boot.img
 			/usr/bin/mkbootimg \
+				--header_version 4 \
+				--pagesize 4096 \
 				--kernel "${DESTIMG}/Image.gz-${dtb_name}" \
 				--ramdisk "${new_rootfs_image_mount_dir}"/boot/initrd.img-*-* \
-				--base 0x0 \
-				--second_offset 0x00f00000 \
 				--cmdline "${bootimg_cmdline}" \
-				--kernel_offset 0x8000 \
-				--ramdisk_offset 0x1000000 \
-				--tags_offset 0x100 \
-				--pagesize 4096 \
-				-o "${DESTIMG}/${version}.boot_${dtb_name}.img"
+				--os_version 14.0.0 \
+				--os_patch_level 2026-03 \
+				--output "${DESTIMG}/${version}.boot_${dtb_name}.img"
 		done
 		display_alert "Creatng abl kernel boot recovery image with dtb ${ABL_DTB_LIST[0]}" "${EXTENSION}" "info"
 		/usr/bin/mkbootimg \
+			--header_version 4 \
+			--pagesize 4096 \
 			--kernel "${DESTIMG}/Image.gz-${ABL_DTB_LIST[0]}" \
 			--ramdisk "${new_rootfs_image_mount_dir}"/boot/initrd.img-*-* \
-			--base 0x0 \
-			--second_offset 0x00f00000 \
-			--kernel_offset 0x8000 \
-			--ramdisk_offset 0x1000000 \
-			--tags_offset 0x100 \
-			--pagesize 4096 \
-			-o "${DESTIMG}/${version}.boot_recovery.img"
+			--os_version 14.0.0 \
+			--os_patch_level 2026-03 \
+			--output "${DESTIMG}/${version}.boot_recovery.img"
 	fi
 
 	umount "${new_rootfs_image_mount_dir}"

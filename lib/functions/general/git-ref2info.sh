@@ -177,7 +177,7 @@ function memoized_git_ref_to_info() {
 							url="https://${GHPROXY_ADDRESS}/https://raw.githubusercontent.com/torvalds/linux/${sha1}/Makefile"
 							;;
 						*)
-							url="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/Makefile?h=${sha1}"
+							url="https://raw.githubusercontent.com/gregkh/linux/${sha1}/Makefile"
 							;;
 					esac
 					;;

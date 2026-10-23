@@ -1,0 +1,10 @@
+--- a/drivers/pinctrl/qcom/pinctrl-sm8250-lpass-lpi.c
++++ b/drivers/pinctrl/qcom/pinctrl-sm8250-lpass-lpi.c
+@@ -138,6 +138,7 @@
+ 	.driver = {
+ 		   .name = "qcom-sm8250-lpass-lpi-pinctrl",
+ 		   .of_match_table = lpi_pinctrl_of_match,
++		   .pm = &lpi_pinctrl_pm_ops,
+ 	},
+ 	.probe = lpi_pinctrl_probe,
+ 	.remove = lpi_pinctrl_remove,
